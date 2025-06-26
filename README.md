@@ -2,9 +2,7 @@
 
 An Arduino project that demonstrates a finite automaton simulated over encrypted data using the EC-ElGamal partially homomorphic encryption scheme. The entire simulation, including verification against clear-text results, runs on a single ESP32 microcontroller.
 
------
-
-## \#\# Key Features
+## Key Features
 
   * **Homomorphic Computation**: Performs state transitions and calculates enabled events on encrypted state vectors without decryption.
   * **Fully Generic Design**: Easily adaptable to different automata—including structure, rules, initial state, and event sequence—by changing a single configuration function.
@@ -12,9 +10,7 @@ An Arduino project that demonstrates a finite automaton simulated over encrypted
   * **Cryptography**: Uses the Mbed TLS library (included with the ESP32 core) for `secp256r1` elliptic curve cryptography.
   * **Memory-Aware**: Includes careful memory management to run on the resource-constrained environment of a microcontroller.
 
------
-
-## \#\# Requirements
+## Requirements
 
 ### Hardware
 
@@ -26,9 +22,7 @@ An Arduino project that demonstrates a finite automaton simulated over encrypted
   * ESP32 Board Support Package installed in the Arduino IDE.
       * *Note: No external libraries are needed, as Mbed TLS is included with the ESP32 core.*
 
------
-
-## \#\# Setup & Installation
+## Setup & Installation
 
 1.  **Install Arduino & ESP32 Core**: Make sure you have the Arduino IDE installed and have added the ESP32 boards through the Board Manager.
 2.  **Open the File**: Open the `.ino` project file in the Arduino IDE.
@@ -36,9 +30,7 @@ An Arduino project that demonstrates a finite automaton simulated over encrypted
 4.  **Upload**: Click the "Upload" button to compile and flash the code to your ESP32.
 5.  **Monitor**: Open the Serial Monitor and set the baud rate to **115200**. The simulation will begin automatically.
 
------
-
-## \#\# How It Works
+## How It Works
 
 The project is based on two core concepts:
 
@@ -60,9 +52,7 @@ Here’s what that means:
 
 This property allows us to perform the matrix-vector multiplications (`B * state` and `R * state`) on the encrypted state vector by using a series of these homomorphic additions, all without ever decrypting the data.
 
------
-
-## \#\# How to Customize the Automaton
+## How to Customize the Automaton
 
 This project is designed to be fully generic. **To define a completely new automaton and simulation run, you only need to edit the `define_automaton()` function.**
 
@@ -100,9 +90,7 @@ void define_automaton(AutomatonConfig& config) {
 }
 ```
 
------
-
-## \#\# Example Output
+## Example Output
 
 When you run the code, you should see the following output in your Serial Monitor, with the results from the homomorphic and clear-text calculations matching at each step.
 
