@@ -1,5 +1,5 @@
 // =============================================================================
-// homomorphic-esp32-modular_auto.ino  (v8c)
+// homomorphic-esp32-modular_auto.ino 
 //
 // DES synthesis + EC-ElGamal homomorphic benchmark on ESP32.
 //
@@ -126,7 +126,10 @@ struct ModSupervisor {
     int num_global_events;
 };
 
-typedef struct { mbedtls_ecp_point c1; mbedtls_ecp_point c2; } Ciphertext;
+typedef struct { 
+    mbedtls_ecp_point c1; 
+    mbedtls_ecp_point c2; 
+} Ciphertext;
 
 // Completely separate oracle state — never shares memory with HE paths.
 struct OracleState {
@@ -172,6 +175,7 @@ AutomatonConfig active_automaton;
 bool            mono_he_runnable = false;  // true only if states fit in heap
 int             mono_state_count = 0;      // exact synthesised state count
 long            measured_muladd_us = 0;    // measured on device at startup
+long            measured_scalar_mul_us_g = 80000; // scalar_mul cost (us), default 80ms
 
 std::vector<ModSupervisor>           lmod_supervisors;
 std::vector<std::vector<Ciphertext>> enc_lmod_states;
@@ -554,63 +558,221 @@ static int sparse_transition(const std::vector<Ciphertext>& enc_state,
 #define PROBLEM_FMS                    3
 #define PROBLEM_CUSTOM                 4
 
-#define ACTIVE_PROBLEM PROBLEM_SMALL_FACTORY   // <-- CHANGE THIS LINE
+#define ACTIVE_PROBLEM PROBLEM_FMS   // <-- CHANGE THIS LINE
 
 static DFA make_machine(const String& n,const String& s,const String& f){
-    DFA m;m.name=n;m.num_states=2;m.initial=0;m.marked={true,false};
-    m.transitions={{0,s,1},{1,f,0}};m.build_delta();return m;}
+    DFA m;
+    m.name=n;
+    m.num_states=2;
+    m.initial=0;
+    m.marked={true,false};
+    m.transitions={{0,s,1},{1,f,0}};
+    m.build_delta();
+    return m;
+}
 static DFA make_buffer(const String& n,const String& f,const String& d){
-    DFA b;b.name=n;b.num_states=2;b.initial=0;b.marked={true,false};
-    b.transitions={{0,f,1},{1,d,0}};b.build_delta();return b;}
+    DFA b;
+    b.name=n;
+    b.num_states=2;
+    b.initial=0;
+    b.marked={true,false};
+    b.transitions={{0,f,1},{1,d,0}};
+    b.build_delta();
+    return b;
+}
 
 #if ACTIVE_PROBLEM == PROBLEM_SMALL_FACTORY
 std::vector<DFA> define_plants(){
-    return {make_machine("M1","e1","e2"),make_machine("M2","e3","e4")};}
-std::vector<DFA> define_specs(){return {make_buffer("E","e2","e3")};}
+    return {
+        make_machine("M1","e1","e2"),
+        make_machine("M2","e3","e4")};
+        }
+std::vector<DFA> define_specs(){
+    return {
+        make_buffer("E","e2","e3")};
+        }
 std::vector<String> define_simulation_sequence(){
-    return {"e1","e2","e3","e1","e4"};}
+    return {"e1","e2","e3","e1","e4"};
+    }
 
 #elif ACTIVE_PROBLEM == PROBLEM_EXTENDED_SMALL_FACTORY
 std::vector<DFA> define_plants(){
-    return {make_machine("M1","a1","b1"),make_machine("M2","a2","b2"),
-            make_machine("M3","a3","b3")};}
+    return {
+        make_machine("M1","a1","b1"),
+        make_machine("M2","a2","b2"),
+        make_machine("M3","a3","b3")};
+        }
 std::vector<DFA> define_specs(){
-    return {make_buffer("B1","b1","a2"),make_buffer("B2","b2","a3")};}
+    return {
+        make_buffer("B1","b1","a2"),
+        make_buffer("B2","b2","a3")};
+        }
 std::vector<String> define_simulation_sequence(){
     return {"a1","b1","a2","b2","a3","b3","a1","b1"};}
 
 #elif ACTIVE_PROBLEM == PROBLEM_FMS
 std::vector<DFA> define_plants(){
-    DFA c1;c1.name="C1";c1.num_states=2;c1.initial=0;c1.marked={true,false};
-    c1.transitions={{0,"11",1},{1,"12",0}};c1.build_delta();
-    DFA c2;c2.name="C2";c2.num_states=2;c2.initial=0;c2.marked={true,false};
-    c2.transitions={{0,"21",1},{1,"22",0}};c2.build_delta();
-    DFA la;la.name="Lathe";la.num_states=2;la.initial=0;la.marked={true,false};
-    la.transitions={{0,"41",1},{1,"42",0}};la.build_delta();
-    DFA pd;pd.name="PD";pd.num_states=2;pd.initial=0;pd.marked={true,false};
-    pd.transitions={{0,"81",1},{1,"82",0}};pd.build_delta();
-    DFA mi;mi.name="Mill";mi.num_states=3;mi.initial=0;mi.marked={true,false,false};
-    mi.transitions={{0,"51",1},{1,"52",0},{0,"53",2},{2,"54",0}};mi.build_delta();
-    DFA c3;c3.name="C3";c3.num_states=3;c3.initial=0;c3.marked={true,false,false};
-    c3.transitions={{0,"71",1},{1,"72",0},{0,"73",2},{2,"74",0}};c3.build_delta();
-    DFA ro;ro.name="Robot";ro.num_states=6;ro.initial=0;
+    DFA c1;
+    c1.name="C1";
+    c1.num_states=2;
+    c1.initial=0;
+    c1.marked={true,false};
+    c1.transitions={
+        {0,"11",1},
+        {1,"12",0}
+    };
+    c1.build_delta();
+
+    DFA c2;
+    c2.name="C2";
+    c2.num_states=2;
+    c2.initial=0;
+    c2.marked={true,false};
+    c2.transitions={
+        {0,"21",1},
+        {1,"22",0}
+    };
+    c2.build_delta();
+
+    DFA la;
+    la.name="Lathe";
+    la.num_states=2;
+    la.initial=0;
+    la.marked={true,false};
+    la.transitions={
+        {0,"41",1},
+        {1,"42",0}
+    };
+    la.build_delta();
+
+    DFA pd;
+    pd.name="PD";
+    pd.num_states=2;
+    pd.initial=0;
+    pd.marked={true,false};
+    pd.transitions={
+        {0,"81",1},
+        {1,"82",0}
+    };
+    pd.build_delta();
+
+    DFA mi;
+    mi.name="Mill";
+    mi.num_states=3;
+    mi.initial=0;
+    mi.marked={true,false,false};
+    mi.transitions={
+        {0,"51",1},
+        {1,"52",0},
+        {0,"53",2},
+        {2,"54",0}
+    };
+    mi.build_delta();
+
+    DFA c3;
+    c3.name="C3";
+    c3.num_states=3;
+    c3.initial=0;
+    c3.marked={true,false,false};
+    c3.transitions={
+        {0,"71",1},
+        {1,"72",0},
+        {0,"73",2},
+        {2,"74",0}
+    };
+    c3.build_delta();
+    
+    DFA ro;
+    ro.name="Robot";
+    ro.num_states=6;
+    ro.initial=0;
     ro.marked={true,false,false,false,false,false};
-    ro.transitions={{0,"31",1},{1,"32",0},{0,"33",2},{2,"34",0},{0,"35",3},{3,"36",0},
-                    {0,"37",4},{4,"38",0},{0,"39",5},{5,"30",0}};ro.build_delta();
-    DFA am;am.name="AM";am.num_states=4;am.initial=0;am.marked={true,false,false,false};
-    am.transitions={{0,"61",1},{1,"63",2},{1,"65",3},{2,"64",0},{3,"66",0}};am.build_delta();
-    return {c1,c2,la,mi,ro,am,c3,pd};}
+    ro.transitions={
+        {0,"31",1},
+        {1,"32",0},
+        {0,"33",2},
+        {2,"34",0},
+        {0,"35",3},
+        {3,"36",0},
+        {0,"37",4},
+        {4,"38",0},
+        {0,"39",5},
+        {5,"30",0}
+    };
+    ro.build_delta();
+    
+    DFA am;
+    am.name="AM";
+    am.num_states=4;
+    am.initial=0;
+    am.marked={true,false,false,false};
+    am.transitions={
+        {0,"61",1},
+        {1,"63",2},
+        {1,"65",3},
+        {2,"64",0},
+        {3,"66",0}
+    };
+    am.build_delta();
+    return {c1,c2,la,mi,ro,am,c3,pd};
+}
+
 std::vector<DFA> define_specs(){
-    DFA e1=make_buffer("E1","12","31");DFA e2=make_buffer("E2","22","33");
-    DFA e5=make_buffer("E5","36","61");DFA e6=make_buffer("E6","38","63");
-    DFA e3;e3.name="E3";e3.num_states=3;e3.initial=0;e3.marked={true,false,false};
-    e3.transitions={{0,"32",1},{1,"41",0},{0,"42",2},{2,"35",0}};e3.build_delta();
-    DFA e7;e7.name="E7";e7.num_states=3;e7.initial=0;e7.marked={true,false,false};
-    e7.transitions={{0,"30",1},{1,"71",0},{0,"74",2},{2,"65",0}};e7.build_delta();
-    DFA e8;e8.name="E8";e8.num_states=3;e8.initial=0;e8.marked={true,false,false};
-    e8.transitions={{0,"72",1},{1,"81",0},{0,"82",2},{2,"73",0}};e8.build_delta();
-    DFA e4;e4.name="E4";e4.num_states=4;e4.initial=0;e4.marked={true,false,false,false};
-    e4.transitions={{0,"34",1},{1,"51",0},{1,"53",0},{0,"52",2},{2,"37",0},{0,"54",3},{3,"39",0}};
+    DFA e1=make_buffer("E1","12","31");
+    DFA e2=make_buffer("E2","22","33");
+    DFA e5=make_buffer("E5","36","61");
+    DFA e6=make_buffer("E6","38","63");
+    DFA e3;
+    e3.name="E3";
+    e3.num_states=3;
+    e3.initial=0;
+    e3.marked={true,false,false};
+    e3.transitions={
+        {0,"32",1},
+        {1,"41",0},
+        {0,"42",2},
+        {2,"35",0}
+    };
+    e3.build_delta();
+
+    DFA e7;
+    e7.name="E7";
+    e7.num_states=3;
+    e7.initial=0;
+    e7.marked={true,false,false};
+    e7.transitions={
+        {0,"30",1},
+        {1,"71",0},
+        {0,"74",2},
+        {2,"65",0}
+    };
+    e7.build_delta();
+    DFA e8;
+    e8.name="E8";
+    e8.num_states=3;
+    e8.initial=0;
+    e8.marked={true,false,false};
+    e8.transitions={
+        {0,"72",1},
+        {1,"81",0},
+        {0,"82",2},
+        {2,"73",0}
+    };
+    e8.build_delta();
+    DFA e4;
+    e4.name="E4";
+    e4.num_states=4;
+    e4.initial=0;
+    e4.marked={true,false,false,false};
+    e4.transitions={
+        {0,"34",1},
+        {1,"51",0},
+        {1,"53",0},
+        {0,"52",2},
+        {2,"37",0},
+        {0,"54",3},
+        {3,"39",0}
+    };
     e4.build_delta();
     return {e1,e2,e3,e4,e5,e6,e7,e8};}
 std::vector<String> define_simulation_sequence(){
@@ -618,8 +780,14 @@ std::vector<String> define_simulation_sequence(){
 
 #elif ACTIVE_PROBLEM == PROBLEM_CUSTOM
 std::vector<DFA> define_plants(){
-    return {make_machine("MA","alpha1","beta1"),make_machine("MB","alpha2","beta2")};}
-std::vector<DFA> define_specs(){return {make_buffer("BUF","beta1","alpha2")};}
+    return {
+        make_machine("MA","alpha1","beta1"),
+        make_machine("MB","alpha2","beta2")};
+    }
+std::vector<DFA> define_specs(){
+    return {
+        make_buffer("BUF","beta1","alpha2")};
+    }
 std::vector<String> define_simulation_sequence(){
     return {"alpha1","beta1","alpha2","beta2"};}
 #endif
@@ -729,7 +897,7 @@ static void print_vec(const std::vector<int>& v){
 void setup(){
     Serial.begin(115200);delay(200);
     Serial.println("\n============================================");
-    Serial.println("  DES Homomorphic Benchmark (ESP32 v8c)");
+    Serial.println("  DES Homomorphic Benchmark (ESP32 v8d)");
     Serial.println("  Monolithic vs Local Modular");
     Serial.println("============================================\n");
 
@@ -769,27 +937,53 @@ void setup(){
     g_enc_zero_ready=true;
     Serial.println("Crypto ready.\n");
 
-    // Measure actual muladd cost on this device.
-    // This gives an accurate theoretical estimate for the monolithic HE cost.
-    // We encrypt two dummy points and time one muladd call.
+    // Measure actual EC operation costs on this device.
+    // muladd (used for homomorphic point addition) and scalar_mul (used for decrypt).
+    // These give accurate theoretical estimates for the monolithic HE cost.
     {
         Ciphertext ca, cb;
         ec_elgamal_encrypt(0, &ca);
         ec_elgamal_encrypt(0, &cb);
-        // Warm-up
+        // Warm-up muladd
         mbedtls_ecp_point tmp; mbedtls_ecp_point_init(&tmp);
         mbedtls_ecp_muladd(grp_ptr,&tmp,&g_one,&ca.c1,&g_one,&cb.c1);
         mbedtls_ecp_point_free(&tmp);
-        // Timed run (average of 3)
+        // Time muladd (avg of 3)
         long t0=micros();
         for(int _i=0;_i<3;++_i){
-            mbedtls_ecp_point tmp2; mbedtls_ecp_point_init(&tmp2);
-            mbedtls_ecp_muladd(grp_ptr,&tmp2,&g_one,&ca.c1,&g_one,&cb.c1);
-            mbedtls_ecp_point_free(&tmp2);}
+            mbedtls_ecp_point t2; mbedtls_ecp_point_init(&t2);
+            mbedtls_ecp_muladd(grp_ptr,&t2,&g_one,&ca.c1,&g_one,&cb.c1);
+            mbedtls_ecp_point_free(&t2);}
         measured_muladd_us = (micros()-t0)/3;
+        // Time scalar_mul (used in decrypt: neg_priv * c1). Avg of 3.
+        mbedtls_mpi np; mbedtls_mpi_init(&np);
+        mbedtls_mpi_sub_mpi(&np,&grp_ptr->N,priv_key_ptr);
+        // Warm-up
+        mbedtls_ecp_point ns; mbedtls_ecp_point_init(&ns);
+        mbedtls_ecp_mul(grp_ptr,&ns,&np,&ca.c1,mbedtls_ctr_drbg_random,ctr_drbg_ptr);
+        mbedtls_ecp_point_free(&ns);
+        t0=micros();
+        for(int _i=0;_i<3;++_i){
+            mbedtls_ecp_point ns2; mbedtls_ecp_point_init(&ns2);
+            mbedtls_ecp_mul(grp_ptr,&ns2,&np,&ca.c1,mbedtls_ctr_drbg_random,ctr_drbg_ptr);
+            mbedtls_ecp_point_free(&ns2);}
+        long measured_scalar_mul_us = (micros()-t0)/3;
+        mbedtls_mpi_free(&np);
         mbedtls_ecp_point_free(&ca.c1); mbedtls_ecp_point_free(&ca.c2);
         mbedtls_ecp_point_free(&cb.c1); mbedtls_ecp_point_free(&cb.c2);
-        Serial.printf("EC muladd measured: %ld us\n", measured_muladd_us);
+        Serial.printf("EC muladd:     %ld us\n", measured_muladd_us);
+        Serial.printf("EC scalar_mul: %ld us\n", measured_scalar_mul_us);
+        // Store scalar_mul cost for use in theoretical estimate below
+        // (decrypt = 1 scalar_mul + 1 muladd per event)
+        // We store it in a local that the summary block can access via a global
+        // Workaround: encode in measured_muladd_us upper bits — instead use a simple
+        // global. We'll just compute decrypt cost inline in the summary.
+        // Pass scalar_mul_us to summary via a temporary global approach:
+        // Actually simplest: just print it here and use a fixed 80ms for scalar_mul
+        // since the measurement is available. We capture it in the summary via closure.
+        // Since C++ lambdas are not trivial here, we use a second global.
+        // Add measured_scalar_mul_us to global state for use in summary.
+        measured_scalar_mul_us_g = measured_scalar_mul_us;
     }
 
     // Encrypt initial states
@@ -900,21 +1094,33 @@ void setup(){
         int exact_m = num_ev;
         long muladd_ms = measured_muladd_us / 1000;
         if(muladd_ms < 1) muladd_ms = 1;
-        long avg_enabled = exact_n / 6;  // conservative: ~1/6 of states enable each event
+        long scalar_mul_ms = measured_scalar_mul_us_g / 1000;
+        if(scalar_mul_ms < 1) scalar_mul_ms = 1;
+        // avg enabled states per R row: Robot has 6 states, each event fires from 1.
+        // Events in the monolithic FMS supervisor fire from ~1/6 of states on average.
+        long avg_enabled = (long)exact_n / 6;
         if(avg_enabled < 1) avg_enabled = 1;
-        // Each R row: avg_enabled EC adds × 2 (c1+c2) × muladd_ms
+        // R-matvec: each row sums avg_enabled ciphertexts.
+        // Each ciphertext addition = 2 muladd calls (c1 and c2).
+        // First term is free (point copy); subsequent terms each cost 1 muladd.
+        // So per row: (avg_enabled - 1) × 2 × muladd_ms. Use avg_enabled as upper bound.
         long est_matvec_ms = (long)exact_m * avg_enabled * 2 * muladd_ms;
-        long est_decrypt_ms = (long)exact_m * (measured_muladd_us*2/1000);  // decrypt ~2×muladd
+        // Decrypt: 1 scalar_mul + 1 muladd per event (ec_elgamal_decrypt implementation)
+        long est_decrypt_ms_per_ev = scalar_mul_ms + muladd_ms;
+        long est_decrypt_ms = (long)exact_m * est_decrypt_ms_per_ev;
         long est_total_ms = est_matvec_ms + est_decrypt_ms;
         Serial.printf("  Monolithic : HE SKIPPED\n");
-        Serial.printf("               Exact supervisor: %d states, %d events\n",exact_n,exact_m);
-        Serial.printf("               Device EC muladd: %ld ms\n", muladd_ms);
-        Serial.printf("               Est. R-matvec:   %ld ms/step (%dev x ~%ldst x 2pts x %ldms)\n",
+        Serial.printf("               Supervisor: %d states, %d events\n",exact_n,exact_m);
+        Serial.printf("               Measured EC muladd:     %ld ms\n", muladd_ms);
+        Serial.printf("               Measured EC scalar_mul: %ld ms\n", scalar_mul_ms);
+        Serial.printf("               Est. R-matvec: %ld ms/step\n"
+                      "                 (%d ev x ~%ld enabled_st x 2pts x %ld ms/muladd)\n",
                       est_matvec_ms, exact_m, avg_enabled, muladd_ms);
-        Serial.printf("               Est. decrypt:    %ld ms/step (%dev x ~%ldms)\n",
-                      est_decrypt_ms, exact_m, measured_muladd_us*2/1000);
-        Serial.printf("               Est. total HE:  ~%ld ms/step\n", est_total_ms);
-        Serial.printf("               LMod actual avg: %ld ms/step\n", (total_lmod/1000)/ns);
+        Serial.printf("               Est. decrypt:  %ld ms/step\n"
+                      "                 (%d ev x (%ld scalar_mul + %ld muladd) ms)\n",
+                      est_decrypt_ms, exact_m, scalar_mul_ms, muladd_ms);
+        Serial.printf("               Est. total HE: ~%ld ms/step\n", est_total_ms);
+        Serial.printf("               LMod actual:   %ld ms/step\n", (total_lmod/1000)/ns);
         if(total_lmod>0)
             Serial.printf("               Theoretical speedup: ~%.0fx\n",
                           (float)est_total_ms / ((total_lmod/1000)/ns));}
