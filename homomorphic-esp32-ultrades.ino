@@ -1,5 +1,5 @@
 // =============================================================================
-// homomorphic-esp32-ultrades-json-nova.ino
+// homomorphic-esp32-ultrades.ino
 //
 // Homomorphic DES supervisor evaluation benchmark for the ESP32.
 // Uses EC-ElGamal encryption (secp256k1) to evaluate supervisors without
@@ -76,6 +76,14 @@
 // Two per ciphertext = 66 bytes total.
 // Full mbedtls_ecp_point structs would cost ~400 bytes per ciphertext — 6× more.
 #define PT_LEN 33
+
+// Set to 1 to force full HE decryption every step (benchmark mode).
+// Set to 0 to enable the shadow optimisation (production mode).
+// With FORCE_HE_DECRYPT 0, one-hot states skip decryption entirely —
+// the timing will appear very fast but does not reflect HE cost.
+// With FORCE_HE_DECRYPT 1, every constraining event triggers sum_row +
+// elgamal_decrypt — this is the true homomorphic evaluation cost.
+#define FORCE_HE_DECRYPT 1
 
 
 // =============================================================================
@@ -165,8 +173,8 @@ static mbedtls_entropy_context  g_entropy;  // hardware entropy source
 static Ciphertext g_zero;
 
 // EC operation timing (measured once on boot, used in timing estimates).
-static long g_muladd_us    = 0;    // time for one ecp_muladd call (µs)
-static long g_scalarmul_us = 80000; // time for one ecp_mul call (µs)
+static long g_muladd_ms    = 0;    // time for one ecp_muladd call (ms)
+static long g_scalarmul_ms = 80000; // time for one ecp_mul call (ms)
 
 // Per-step counter of actual HE decryptions performed (vs shadow-skipped).
 static int g_step_decrypts = 0;
@@ -629,7 +637,11 @@ static int he_step(int ev_gi, std::vector<int>& en_out) {
                 if (sv.shadow[s]) { active_count++; active_state = s; }
 
             int e;
+#if FORCE_HE_DECRYPT
+            if (false) {
+#else
             if (active_count == 1) {
+#endif
                 // One-hot state (normal case): read enablement from PROGMEM.
                 // No EC operations at all — just a table lookup in flash.
                 e = (int)pm_i8(sv.desc->enable, gi * n + active_state);
@@ -814,8 +826,8 @@ static void run_benchmark(const char* label, const SupDesc* descs, int count) {
     Oracle oracle;
     oracle.init(descs, count);
 
-    // Timing accumulators (all in microseconds — micros() resolution is 1 µs).
-    long total_us = 0, min_us = LONG_MAX, max_us = 0;
+    // Timing accumulators (all in microseconds — micros() resolution is 1 ms).
+    long total_ms = 0, min_ms = LONG_MAX, max_ms = 0;
     int  total_decrypts = 0;
     bool all_ok = true;
 
@@ -833,14 +845,14 @@ static void run_benchmark(const char* label, const SupDesc* descs, int count) {
         // Run HE step (timed).
         std::vector<int> he_en;
         g_step_decrypts = 0;
-        long t0      = micros();
+        long t0      = millis();
         int  ret     = he_step(ev_gi, he_en);
-        long step_us = micros() - t0;
+        long step_ms = millis() - t0;
 
-        total_us    += step_us;
+        total_ms    += step_ms;
         total_decrypts += g_step_decrypts;
-        if (step_us < min_us) min_us = step_us;
-        if (step_us > max_us) max_us = step_us;
+        if (step_ms < min_ms) min_ms = step_ms;
+        if (step_ms > max_ms) max_ms = step_ms;
 
         if (ret) {
             Serial.printf("  HE ERROR -0x%04X\n", -ret);
@@ -852,19 +864,19 @@ static void run_benchmark(const char* label, const SupDesc* descs, int count) {
         Serial.print("  [HE]     "); print_vec(he_en);     Serial.println();
         bool ok = (he_en == oracle_en);
         if (!ok) all_ok = false;
-        Serial.printf("  Time: %ld µs  |  HE decrypts: %d  |  %s\n\n",
-                      step_us, g_step_decrypts, ok ? "OK" : "FAIL");
+        Serial.printf("  Time: %ld ms  |  HE decrypts: %d  |  %s\n\n",
+                      step_ms, g_step_decrypts, ok ? "OK" : "FAIL");
     }
 
     int ns = SIM_SEQ_LEN ? SIM_SEQ_LEN : 1;
     Serial.println("--------------------------------------------");
     Serial.println("  TIMING SUMMARY");
     Serial.println("--------------------------------------------");
-    Serial.printf("  Total HE time  : %ld µs  (%ld ms)\n",
-                  total_us, total_us / 1000);
-    Serial.printf("  Avg  per step  : %ld µs\n", total_us / ns);
-    Serial.printf("  Min  per step  : %ld µs\n", min_us);
-    Serial.printf("  Max  per step  : %ld µs\n", max_us);
+    Serial.printf("  Total HE time  : %ld ms  (%ld s)\n",
+                  total_ms, total_ms / 1000);
+    Serial.printf("  Avg  per step  : %ld ms\n", total_ms / ns);
+    Serial.printf("  Min  per step  : %ld ms\n", min_ms);
+    Serial.printf("  Max  per step  : %ld ms\n", max_ms);
     Serial.printf("  Total HE decrypts: %d  (shadow skipped the rest)\n",
                   total_decrypts);
     Serial.printf("  Supervisors    : %d  (ALL encrypted)\n", count);
@@ -922,19 +934,19 @@ void setup() {
         mbedtls_ecp_point_init(&R); mbedtls_mpi_init(&k);
         mbedtls_ecp_copy(&P, &g_G); mbedtls_ecp_copy(&Q, &g_G);
         mbedtls_mpi_lset(&k, 1);
-        long t0 = micros();
+        long t0 = millis();
         for (int i = 0; i < 5; ++i)
             mbedtls_ecp_muladd(&g_grp, &R, &k, &P, &k, &Q);
-        g_muladd_us = (micros() - t0) / 5;
-        t0 = micros();
+        g_muladd_ms = (millis() - t0) / 5;
+        t0 = millis();
         for (int i = 0; i < 5; ++i)
             mbedtls_ecp_mul(&g_grp, &R, &k, &g_G,
                              mbedtls_ctr_drbg_random, &g_drbg);
-        g_scalarmul_us = (micros() - t0) / 5;
+        g_scalarmul_ms = (millis() - t0) / 5;
         mbedtls_ecp_point_free(&P); mbedtls_ecp_point_free(&Q);
         mbedtls_ecp_point_free(&R); mbedtls_mpi_free(&k);
-        Serial.printf("[Crypto] muladd=%ld µs  scalar_mul=%ld µs\n\n",
-                      g_muladd_us, g_scalarmul_us);
+        Serial.printf("[Crypto] muladd=%ld ms  scalar_mul=%ld ms\n\n",
+                      g_muladd_ms, g_scalarmul_ms);
     }
 
     // ── 3. Self-test — must pass before any benchmark ─────────────────────────
@@ -955,7 +967,10 @@ void setup() {
     // ── 5. Local modular benchmark ────────────────────────────────────────────
     run_benchmark("LOCAL MODULAR", LMOD_SUPS, LMOD_COUNT);
 
-    // ── 6. Cleanup mbedTLS resources ──────────────────────────────────────────
+    // ── 6. Local modular REDUCED benchmark ───────────────────────────────────
+    run_benchmark("LOCAL MODULAR REDUCED", LMOD_RED_SUPS, LMOD_RED_COUNT);
+
+    // ── 7. Cleanup mbedTLS resources ──────────────────────────────────────────
     mbedtls_ecp_group_free(&g_grp);
     mbedtls_ecp_point_free(&g_G);   mbedtls_ecp_point_free(&g_pub);
     mbedtls_mpi_free(&g_priv);      mbedtls_mpi_free(&g_one);

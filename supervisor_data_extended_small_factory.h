@@ -95,6 +95,54 @@ static const SupDesc LMOD_SUPS[] = {
     { LMOD_1_NAME, 6, lm1_init, lm1_enable, lm1_tcnt, lm1_trans },
 };
 
+// ── Local modular reduced supervisors (2 total) ──────────────────────
+#define LMOD_RED_COUNT 2
+
+// S0_red  —  2 states (+4), 5 transitions (+3)
+static const int8_t lmr0_init[] PROGMEM = {
+    1, 0
+};
+
+static const int8_t lmr0_enable[] PROGMEM = {
+    1, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1
+};
+
+static const uint16_t lmr0_tcnt[] PROGMEM = {
+    1, 1, 0, 1, 2, 0
+};
+
+static const int16_t lmr0_trans[] PROGMEM = {
+    0, 0, 1, 0, 0, 1, 0, 0, 1, 1
+};
+
+static const char LMOD_RED_0_NAME[] PROGMEM = "S0_red";
+
+// S1_red  —  2 states (+4), 5 transitions (+3)
+static const int8_t lmr1_init[] PROGMEM = {
+    1, 0
+};
+
+static const int8_t lmr1_enable[] PROGMEM = {
+    1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 1, 1
+};
+
+static const uint16_t lmr1_tcnt[] PROGMEM = {
+    0, 1, 1, 0, 1, 2
+};
+
+static const int16_t lmr1_trans[] PROGMEM = {
+    0, 0, 1, 0, 0, 1, 0, 0, 1, 1
+};
+
+static const char LMOD_RED_1_NAME[] PROGMEM = "S1_red";
+
+static const SupDesc LMOD_RED_SUPS[] = {
+    // S0_red: 2 states
+    { LMOD_RED_0_NAME, 2, lmr0_init, lmr0_enable, lmr0_tcnt, lmr0_trans },
+    // S1_red: 2 states
+    { LMOD_RED_1_NAME, 2, lmr1_init, lmr1_enable, lmr1_tcnt, lmr1_trans },
+};
+
 // ── Monolithic supervisor — 18 states ─────────────────────────
 static const int8_t mono_init[] PROGMEM = {
     1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0

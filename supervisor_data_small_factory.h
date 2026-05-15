@@ -71,6 +71,33 @@ static const SupDesc LMOD_SUPS[] = {
     { LMOD_0_NAME, 6, lm0_init, lm0_enable, lm0_tcnt, lm0_trans },
 };
 
+// ── Local modular reduced supervisors (1 total) ──────────────────────
+#define LMOD_RED_COUNT 1
+
+// S0_red  —  2 states (+4), 5 transitions (+3)
+static const int8_t lmr0_init[] PROGMEM = {
+    1, 0
+};
+
+static const int8_t lmr0_enable[] PROGMEM = {
+    1, 0, 1, 0, 0, 1, 1, 1
+};
+
+static const uint16_t lmr0_tcnt[] PROGMEM = {
+    1, 1, 1, 2
+};
+
+static const int16_t lmr0_trans[] PROGMEM = {
+    0, 0, 0, 1, 1, 0, 0, 0, 1, 1
+};
+
+static const char LMOD_RED_0_NAME[] PROGMEM = "S0_red";
+
+static const SupDesc LMOD_RED_SUPS[] = {
+    // S0_red: 2 states
+    { LMOD_RED_0_NAME, 2, lmr0_init, lmr0_enable, lmr0_tcnt, lmr0_trans },
+};
+
 // ── Monolithic supervisor — 6 states ─────────────────────────
 static const int8_t mono_init[] PROGMEM = {
     1, 0, 0, 0, 0, 0
