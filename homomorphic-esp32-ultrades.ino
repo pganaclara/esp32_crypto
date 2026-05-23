@@ -1,338 +1,228 @@
 // =============================================================================
-// homomorphic-esp32-ultrades.ino
+// ESP32 Homomorphic DES benchmark — EC-ElGamal on NIST P-192, dual-core FreeRTOS
+// =============================================================================
 //
-// Homomorphic DES supervisor evaluation benchmark for the ESP32.
-// Uses EC-ElGamal encryption (secp256k1) to evaluate supervisors without
-// ever decrypting the state vector in the normal run path.
+// The supervisor state lives only as EC-ElGamal ciphertexts in RAM. The active
+// state is never decrypted on the normal path — we homomorphically OR the
+// enabled cells of each constraining row and decrypt only the resulting bit.
 //
-// ── QUICK START ──────────────────────────────────────────────────────────────
-//  1. Run the UltraDES notebook → generates supervisor_data_<PROBLEM>.h
-//  2. Copy the .h file to this sketch folder.
-//  3. Update the #include below to match the filename.
-//  4. Flash and open Serial Monitor at 115200 baud.
+// Optimisations layered on top of the basic scheme:
+//   * Conditional invariance — at load time, for every (sup, event, row) we
+//     precompute whether the row can flip 0→1, 1→0, both, or neither. At
+//     runtime we re-decrypt only rows whose current cached value could
+//     actually change.
+//   * Persistent decompressed cache — each supervisor keeps its ciphertexts
+//     in BOTH compressed (Ciphertext, 50 B) and decompressed (mbedtls_ecp_point)
+//     form. do_transition maintains the cache via cheap mbedtls_ecp_copy
+//     instead of running pt_decompress (sqrt) on every read.
+//   * Skip-g_zero summands — after a transition most state cells are the
+//     literal global Enc(0) constant; sum_row skips them.
+//   * Fused row-sum + decrypt — a single mbedtls_ecp_muladd handles the secret
+//     scalar mul and the final add, eliminating the intermediate point.
+//   * Dual-core work-unit split — phase 1 (serial, main core) applies
+//     transitions and enqueues (sup, row) work units; phase 2 splits them
+//     across both cores via a persistent worker task on core 0.
 //
-// ── DATA FORMAT ──────────────────────────────────────────────────────────────
-// supervisor_data_<PROBLEM>.h contains direct C arrays in PROGMEM (flash).
-// There is NO JSON, NO ArduinoJson, NO runtime parsing.
-// All supervisor data is read with pgm_read_byte() / pgm_read_word().
-//
-// ── HOW IT WORKS ─────────────────────────────────────────────────────────────
-// Each supervisor state is encrypted as an EC-ElGamal ciphertext.
-// At each simulation step:
-//   1. The encrypted state vector is updated via a sparse matrix transition
-//      (ciphertext copies — no decryption needed).
-//   2. Enablement is checked homomorphically: we compute Enc(Σ row·state)
-//      and decrypt only the scalar result (0 or 1).
-//   3. SHADOW OPTIMISATION: a cleartext copy of the state distribution is
-//      kept in parallel. For one-hot states (always true in deterministic DES)
-//      the enablement result can be read directly from flash — zero decryptions.
-//      Decryption is only triggered when the shadow shows multiple active states.
-//   4. The Oracle (pure cleartext) runs independently for correctness checking.
-//
-// ── MEMORY STRATEGY ──────────────────────────────────────────────────────────
-// Ciphertexts are stored as COMPRESSED EC POINTS (33 bytes each = 66 bytes per
-// ciphertext). Full mbedtls_ecp_point structs (~400 bytes) are only created
-// transiently during arithmetic and freed immediately after. This lets us fit
-// supervisors with 100+ states in the ESP32's 320 KB DRAM.
-//
-// ── OPTIMISATIONS ────────────────────────────────────────────────────────────
-//  1. PROGMEM C arrays      — zero parse time, data read directly from flash
-//  2. Compressed points     — 66 bytes/ciphertext vs ~400 with full structs
-//  3. Shadow state          — skips HE decrypt for one-hot states (common case)
-//  4. own_event_mask        — O(1) bitmask: does this supervisor own this event?
-//  5. trans_event_mask      — O(1) bitmask: does this event move this supervisor?
-//  6. constrained_gi list   — precomputed list of constraining event indices
-//  7. secp256k1 curve       — a=0 allows faster point-addition formula in mbedTLS
-//  8. yield() between ops   — lets RTOS reclaim heap between EC operations
-//  9. Self-test on boot     — verifies crypto before any benchmark runs
-//
-// ── REQUIRED LIBRARIES ───────────────────────────────────────────────────────
-// No external libraries needed — only the ESP32 Arduino core + mbedTLS.
+// Setup: drop a supervisor_data_<PROBLEM>.h + sdkconfig.ext in the sketch
+// folder, point the #include below at the .h file, flash, and open the Serial
+// Monitor at 115200 baud.
 // =============================================================================
 
 #include <Arduino.h>
-#include <esp_heap_caps.h>        // heap_caps_get_free_size() for memory reporting
-#include <mbedtls/ecp.h>          // EC point arithmetic
-#include <mbedtls/bignum.h>       // Multi-precision integers
-#include <mbedtls/entropy.h>      // Hardware entropy source
-#include <mbedtls/ctr_drbg.h>     // Deterministic random bit generator
-#include <pgmspace.h>             // pgm_read_byte / pgm_read_word (PROGMEM access)
+#include <esp_heap_caps.h>
+#include <esp_timer.h>
+#include <mbedtls/ecp.h>
+#include <mbedtls/bignum.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <pgmspace.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 #include <vector>
-#include <string>
 
-// ── Change this to match the .h file generated by the notebook ───────────────
 #include "supervisor_data_fms.h"
 
-
 // =============================================================================
-// SECTION 1 — CONFIGURATION
-// =============================================================================
-
-// secp256k1 (Bitcoin's curve) has a = 0, which enables a faster Jacobian
-// point-addition formula inside mbedTLS (~15-25% faster than secp256r1).
-#define CURVE MBEDTLS_ECP_DP_SECP256K1
-
-// Compressed EC point: 1 prefix byte (0x02 or 0x03) + 32-byte X coordinate.
-// Two per ciphertext = 66 bytes total.
-// Full mbedtls_ecp_point structs would cost ~400 bytes per ciphertext — 6× more.
-#define PT_LEN 33
-
-// Set to 1 to force full HE decryption every step (benchmark mode).
-// Set to 0 to enable the shadow optimisation (production mode).
-// With FORCE_HE_DECRYPT 0, one-hot states skip decryption entirely —
-// the timing will appear very fast but does not reflect HE cost.
-// With FORCE_HE_DECRYPT 1, every constraining event triggers sum_row +
-// elgamal_decrypt — this is the true homomorphic evaluation cost.
-#define FORCE_HE_DECRYPT 1
-
-
-// =============================================================================
-// SECTION 2 — TYPES
+// Configuration
 // =============================================================================
 
-// ── Ciphertext ────────────────────────────────────────────────────────────────
-// Stores one EC-ElGamal ciphertext as two compressed points.
-// Plain byte arrays — no heap allocation inside the struct.
-// Arithmetic (sum_row, decrypt) decompresses into temporary ecp_point values
-// and frees them immediately after.
-struct Ciphertext {
-    uint8_t c1[PT_LEN];   // r·G  (randomised component)
-    uint8_t c2[PT_LEN];   // m·G + r·Pub  (message component)
-};
+// NIST P-192. 96-bit security (well above any feasible attack) and benefits
+// from mbedTLS's NIST fast-reduction path + ESP32 hardware MPI.
+#define CURVE        MBEDTLS_ECP_DP_SECP192R1
+#define CURVE_NAME   "secp192r1"
+#define PT_LEN       25                          // 1 prefix + 24-byte X coord
+#define CORE_MAIN    1
+#define CORE_WORKER  0
+#define WORKER_STACK 12288
+#define WORKER_PRIO  2                            // above IDLE(0), below system tasks
 
-// ── SupDesc ───────────────────────────────────────────────────────────────────
-// Descriptor generated by the notebook and stored in the .h file.
-// All pointer fields point into PROGMEM — read-only flash storage.
-// (Defined in the generated .h file — shown here for documentation.)
-//
-// struct SupDesc {
-//     const char*      name;       // supervisor label (PROGMEM)
-//     uint16_t         num_states;
-//     const int8_t*    init;       // one-hot initial state  [num_states]
-//     const int8_t*    enable;     // enablement matrix      [EVENT_COUNT × num_states]
-//     const uint16_t*  tcnt;       // transition pair counts [EVENT_COUNT]
-//     const int16_t*   trans;      // flat (from,to) pairs
-// };
+// =============================================================================
+// Types
+// =============================================================================
 
-// ── Supervisor (runtime) ──────────────────────────────────────────────────────
-// Extends SupDesc with live encrypted state, bitmasks, and the shadow.
+struct Ciphertext { uint8_t c1[PT_LEN]; uint8_t c2[PT_LEN]; };
+
 struct Supervisor {
-    const SupDesc* desc;   // pointer to the PROGMEM descriptor
+    const SupDesc* desc;
+    uint32_t       own_event_mask    = 0;            // events this sv constrains or transitions
+    uint32_t       trans_event_mask  = 0;            // events this sv actually transitions on
 
-    // ── Bitmasks (built once at load time, O(1) lookup per step) ─────────────
-    // bit i = 1 means this supervisor responds to / has transitions on event i.
-    uint32_t own_event_mask    = 0;   // supervisor owns event i (enablement or transition)
-    uint32_t trans_event_mask  = 0;   // supervisor has ≥1 transition on event i
-    uint32_t constraining_mask = 0;   // supervisor has ≥1 disabled state for event i
+    std::vector<uint8_t>           constrained_gi;   // global indices of constraining events
+    std::vector<Ciphertext>        enc;             // compressed state vector
+    std::vector<mbedtls_ecp_point> dec_c1, dec_c2;  // decompressed mirror of enc[]
+    std::vector<int8_t>            cached_en;       // last decrypted value per constrained row
 
-    // Precomputed list of global event indices that are constraining.
-    // Avoids re-scanning PROGMEM every step to find which events need checking.
-    std::vector<uint8_t> constrained_gi;
-
-    // ── Encrypted state ───────────────────────────────────────────────────────
-    // enc[s] = EC-ElGamal encryption of the state indicator for state s.
-    // For a one-hot state vector, exactly one enc[s] encrypts 1, rest encrypt 0.
-    std::vector<Ciphertext> enc;
-
-    // ── Enablement cache ──────────────────────────────────────────────────────
-    // cached_en[li] = last computed enablement result for constraining event li.
-    // Valid when cache_valid = true. Avoids redundant decryptions.
-    std::vector<int8_t> cached_en;
-    bool cache_valid = false;
-
-    // ── Shadow state ──────────────────────────────────────────────────────────
-    // Cleartext copy of the state distribution, updated via the SAME transitions
-    // as enc[]. Never used for output — only used to skip HE decryption.
-    //
-    // For deterministic DES, the state is always one-hot: exactly one state
-    // is active at a time. When shadow shows active_count == 1, the enablement
-    // result is just a PROGMEM table lookup — no EC operations needed at all.
-    // Only if active_count > 1 (should not happen in a valid supervisor) do
-    // we fall back to the full HE decrypt path.
-    std::vector<int8_t> shadow;
+    // Conditional invariance: for each event ev,
+    //   changes_if_zero[ev] : rows that may flip 0→1 under this event
+    //   changes_if_one [ev] : rows that may flip 1→0 under this event
+    // Rows in neither list are truly invariant and keep their cached value.
+    std::vector<std::vector<uint8_t>> changes_if_zero;
+    std::vector<std::vector<uint8_t>> changes_if_one;
 };
 
+// One (supervisor, constrained-row) decrypt task.
+struct WorkUnit { uint8_t sv; uint8_t li; };
+
+struct WorkerCmd {
+    int start, end;
+    const std::vector<WorkUnit>* work;
+};
 
 // =============================================================================
-// SECTION 3 — GLOBALS
+// Globals
 // =============================================================================
 
-static std::vector<Supervisor> g_sups;   // loaded supervisors for current benchmark
+static std::vector<Supervisor>  g_sups;
+static mbedtls_ecp_group        g_grp;
+static mbedtls_ecp_point        g_G, g_pub;
+static mbedtls_mpi              g_priv, g_one;
+static mbedtls_mpi              g_neg_priv;             // N - priv, computed once
+static mbedtls_ctr_drbg_context g_drbg;
+static mbedtls_entropy_context  g_entropy;
+static Ciphertext               g_zero;                 // canonical Enc(0) literal
+static bool                     g_dual_core = false;
+static int                      g_step_decrypts = 0;
+static portMUX_TYPE             g_dec_mux = portMUX_INITIALIZER_UNLOCKED;
 
-// ── mbedTLS EC crypto context ─────────────────────────────────────────────────
-static mbedtls_ecp_group        g_grp;      // curve parameters
-static mbedtls_ecp_point        g_G;        // generator point
-static mbedtls_ecp_point        g_pub;      // public key (Pub = priv·G)
-static mbedtls_mpi              g_priv;     // private key scalar
-static mbedtls_mpi              g_one;      // constant 1 (used in ecp_muladd)
-static mbedtls_ctr_drbg_context g_drbg;    // random number generator
-static mbedtls_entropy_context  g_entropy;  // hardware entropy source
-
-// Enc(0) — used to fill "empty" slots in sparse transitions.
-// Precomputed once and reused to avoid redundant encryptions.
-static Ciphertext g_zero;
-
-// EC operation timing (measured once on boot, used in timing estimates).
-static long g_muladd_ms    = 0;    // time for one ecp_muladd call (ms)
-static long g_scalarmul_ms = 80000; // time for one ecp_mul call (ms)
-
-// Per-step counter of actual HE decryptions performed (vs shadow-skipped).
-static int g_step_decrypts = 0;
-
+// IPC for the persistent worker on core 0
+static WorkerCmd          g_wcmd;
+static SemaphoreHandle_t  g_worker_go   = nullptr;
+static SemaphoreHandle_t  g_worker_done = nullptr;
 
 // =============================================================================
-// SECTION 4 — PROGMEM READ HELPERS
+// Small helpers
 // =============================================================================
-// Thin wrappers around pgm_read_byte / pgm_read_word for typed access.
-// Using these instead of raw casts makes the code easier to read and avoids
-// accidental alignment bugs on non-AVR platforms.
 
-inline int8_t pm_i8(const int8_t* arr, int idx) {
-    return (int8_t)pgm_read_byte(arr + idx);
+inline int8_t   pm_i8 (const int8_t*   a, int i) { return (int8_t) pgm_read_byte(a+i); }
+inline int16_t  pm_i16(const int16_t*  a, int i) { return (int16_t)pgm_read_word(a+i); }
+inline uint16_t pm_u16(const uint16_t* a, int i) { return (uint16_t)pgm_read_word(a+i); }
+
+static inline bool is_g_zero(const Ciphertext& c) {
+    return memcmp(&c, &g_zero, sizeof(Ciphertext)) == 0;
 }
 
-inline int16_t pm_i16(const int16_t* arr, int idx) {
-    return (int16_t)pgm_read_word(arr + idx);
+// Offset (in (from,to) pairs) of event `ev`'s transitions in desc->trans.
+static int trans_offset(const SupDesc* desc, int ev) {
+    int off = 0;
+    for (int i = 0; i < ev; ++i) off += (int)pm_u16(desc->tcnt, i);
+    return off;
 }
 
-inline uint16_t pm_u16(const uint16_t* arr, int idx) {
-    return (uint16_t)pgm_read_word(arr + idx);
+// Shallow swap of two ecp_point structs — avoids the MPI deep-copy that
+// mbedtls_ecp_copy() would do.
+static inline void swap_pt(mbedtls_ecp_point* a, mbedtls_ecp_point* b) {
+    mbedtls_ecp_point t = *a; *a = *b; *b = t;
 }
 
-// Read the PROGMEM string pointer for event gi from the EVENT_NAMES table.
-inline const char* pm_event_name(int gi) {
-    return (const char*)pgm_read_ptr(&EVENT_NAMES[gi]);
+// Free the MPI memory held by a Supervisor's decompressed point cache.
+static void sv_free_dec(Supervisor& sv) {
+    for (auto& p : sv.dec_c1) mbedtls_ecp_point_free(&p);
+    for (auto& p : sv.dec_c2) mbedtls_ecp_point_free(&p);
+    sv.dec_c1.clear();
+    sv.dec_c2.clear();
 }
-
 
 // =============================================================================
-// SECTION 5 — COMPRESSED POINT HELPERS
+// EC point I/O
 // =============================================================================
-// EC points are stored in compressed form (33 bytes) and only expanded into
-// full mbedtls_ecp_point structs during arithmetic.
 
-// Compress a full EC point → 33-byte array.
-inline int pt_compress(const mbedtls_ecp_point* P, uint8_t out[PT_LEN]) {
+static int pt_compress(const mbedtls_ecp_point* P, uint8_t out[PT_LEN]) {
     size_t len = 0;
     return mbedtls_ecp_point_write_binary(
         &g_grp, P, MBEDTLS_ECP_PF_COMPRESSED, &len, out, PT_LEN);
 }
 
-// Decompress a 33-byte array → freshly initialised mbedtls_ecp_point.
-// Caller MUST call mbedtls_ecp_point_free() when done.
-inline int pt_decompress(const uint8_t in[PT_LEN], mbedtls_ecp_point* P) {
+static int pt_decompress(const uint8_t in[PT_LEN], mbedtls_ecp_point* P) {
     mbedtls_ecp_point_init(P);
     return mbedtls_ecp_point_read_binary(&g_grp, P, in, PT_LEN);
 }
 
-
-// =============================================================================
-// SECTION 6 — EC-ElGamal CRYPTO
-// =============================================================================
-//
-// EC-ElGamal over secp256k1:
-//   Key generation : priv ← random scalar;  Pub = priv·G
-//   Encrypt(m)     : r ← random;  c1 = r·G;  c2 = m·G + r·Pub
-//   Decrypt(c1,c2) : m·G = c2 - priv·c1;  m = (is_point_at_infinity ? 0 : 1)
-//   Add(ct_a,ct_b) : (c1_a+c1_b, c2_a+c2_b)   — homomorphic addition mod G
-//
-// Plaintext domain is {0, 1} — sufficient for DES state indicators.
-// Decryption distinguishes zero (point at infinity) from non-zero (any other point).
-
-// Helper: R = P + Q using ecp_muladd(1·P + 1·Q).
-static int ecp_add_pts(mbedtls_ecp_point* R,
-                       const mbedtls_ecp_point* P,
-                       const mbedtls_ecp_point* Q) {
+// R = P + Q  (used by self-test only)
+static int pt_add(mbedtls_ecp_point* R,
+                  const mbedtls_ecp_point* P, const mbedtls_ecp_point* Q) {
     return mbedtls_ecp_muladd(&g_grp, R, &g_one, P, &g_one, Q);
 }
 
-// Encrypt m ∈ {0, 1} → compressed Ciphertext.
-static int elgamal_encrypt(int m, Ciphertext* ct) {
-    mbedtls_mpi r;
-    mbedtls_ecp_point rP, c1_pt, c2_pt;
-    mbedtls_mpi_init(&r);
+// =============================================================================
+// EC-ElGamal primitives (used in init and self-test)
+// =============================================================================
+
+static int elgamal_enc(int m, Ciphertext* ct, mbedtls_ctr_drbg_context* drbg) {
+    mbedtls_mpi r;        mbedtls_mpi_init(&r);
+    mbedtls_ecp_point rP, c1, c2;
     mbedtls_ecp_point_init(&rP);
-    mbedtls_ecp_point_init(&c1_pt);
-    mbedtls_ecp_point_init(&c2_pt);
+    mbedtls_ecp_point_init(&c1);
+    mbedtls_ecp_point_init(&c2);
 
-    // c1 = r·G  (randomised component, binds the ciphertext to a random r)
-    int ret = mbedtls_ecp_gen_privkey(&g_grp, &r, mbedtls_ctr_drbg_random, &g_drbg);
+    int ret = mbedtls_ecp_gen_privkey(&g_grp, &r, mbedtls_ctr_drbg_random, drbg);
     if (ret) goto done;
-    ret = mbedtls_ecp_mul(&g_grp, &c1_pt, &r, &g_G,
-                           mbedtls_ctr_drbg_random, &g_drbg);
+    ret = mbedtls_ecp_mul(&g_grp, &c1, &r, &g_G,   mbedtls_ctr_drbg_random, drbg);
     if (ret) goto done;
-
-    // rP = r·Pub  (shared secret component)
-    ret = mbedtls_ecp_mul(&g_grp, &rP, &r, &g_pub,
-                           mbedtls_ctr_drbg_random, &g_drbg);
+    ret = mbedtls_ecp_mul(&g_grp, &rP, &r, &g_pub, mbedtls_ctr_drbg_random, drbg);
     if (ret) goto done;
 
     if (m == 0) {
-        // Enc(0): c2 = rP  (message component is the point at infinity masked by rP)
-        mbedtls_ecp_copy(&c2_pt, &rP);
+        mbedtls_ecp_copy(&c2, &rP);
     } else {
-        // Enc(m): c2 = m·G + rP  (embed m as a scalar multiple of G)
         mbedtls_ecp_point mG; mbedtls_mpi mm;
         mbedtls_ecp_point_init(&mG); mbedtls_mpi_init(&mm);
         mbedtls_mpi_lset(&mm, m);
-        ret = mbedtls_ecp_mul(&g_grp, &mG, &mm, &g_G,
-                               mbedtls_ctr_drbg_random, &g_drbg);
-        if (ret == 0) ret = ecp_add_pts(&c2_pt, &mG, &rP);
-        mbedtls_ecp_point_free(&mG);
-        mbedtls_mpi_free(&mm);
+        ret = mbedtls_ecp_mul(&g_grp, &mG, &mm, &g_G, mbedtls_ctr_drbg_random, drbg);
+        if (ret == 0) ret = pt_add(&c2, &mG, &rP);
+        mbedtls_ecp_point_free(&mG); mbedtls_mpi_free(&mm);
     }
     if (ret) goto done;
-
-    // Compress both components to 33 bytes each
-    ret = pt_compress(&c1_pt, ct->c1);
-    if (ret == 0) ret = pt_compress(&c2_pt, ct->c2);
+    ret = pt_compress(&c1, ct->c1);
+    if (ret == 0) ret = pt_compress(&c2, ct->c2);
 
 done:
     mbedtls_ecp_point_free(&rP);
-    mbedtls_ecp_point_free(&c1_pt);
-    mbedtls_ecp_point_free(&c2_pt);
+    mbedtls_ecp_point_free(&c1);
+    mbedtls_ecp_point_free(&c2);
     mbedtls_mpi_free(&r);
     return ret;
 }
 
-// Decrypt a compressed Ciphertext → 0 or 1.
-// Increments g_step_decrypts so callers can count actual HE operations.
-static int elgamal_decrypt(const Ciphertext* ct, int* out) {
-    g_step_decrypts++;   // track how many real decryptions we perform
-
+// Reference decrypt — used by self-test. The hot path uses row_decrypt below.
+static int elgamal_dec(const Ciphertext* ct, int* out) {
     mbedtls_ecp_point c1, c2, ns, pm;
-    mbedtls_mpi np;
     mbedtls_ecp_point_init(&ns);
     mbedtls_ecp_point_init(&pm);
-    mbedtls_mpi_init(&np);
 
-    // Decompress both components
     int ret = pt_decompress(ct->c1, &c1); if (ret) goto done;
     ret     = pt_decompress(ct->c2, &c2); if (ret) goto done;
-
-    // ns = -priv·c1  (computed as (N - priv)·c1 where N is the curve order)
-    ret = mbedtls_mpi_sub_mpi(&np, &g_grp.N, &g_priv); if (ret) goto done;
-    ret = mbedtls_ecp_mul(&g_grp, &ns, &np, &c1,
-                           mbedtls_ctr_drbg_random, &g_drbg);
-    if (ret) goto done;
-
-    // pm = c2 + ns = (m·G + r·Pub) - priv·(r·G) = m·G
-    ret = ecp_add_pts(&pm, &c2, &ns); if (ret) goto done;
-
-    // m = 0 iff pm is the point at infinity
-    *out = mbedtls_ecp_is_zero(&pm) ? 0 : 1;
+    ret = mbedtls_ecp_muladd(&g_grp, &pm, &g_neg_priv, &c1, &g_one, &c2);
+    if (ret == 0) *out = mbedtls_ecp_is_zero(&pm) ? 0 : 1;
 
 done:
     mbedtls_ecp_point_free(&c1); mbedtls_ecp_point_free(&c2);
     mbedtls_ecp_point_free(&ns); mbedtls_ecp_point_free(&pm);
-    mbedtls_mpi_free(&np);
     return ret;
 }
 
-// Homomorphic addition: out = ct_a ⊕ ct_b  (component-wise EC point addition).
-// Enc(a) ⊕ Enc(b) = Enc(a+b) — this is the core HE property we exploit.
-static int elgamal_add_ct(const Ciphertext* a, const Ciphertext* b,
-                           Ciphertext* out) {
+// Homomorphic ciphertext addition — used by self-test.
+static int elgamal_add(const Ciphertext* a, const Ciphertext* b, Ciphertext* out) {
     mbedtls_ecp_point pa1, pa2, pb1, pb2, r1, r2;
     mbedtls_ecp_point_init(&r1); mbedtls_ecp_point_init(&r2);
 
@@ -340,12 +230,10 @@ static int elgamal_add_ct(const Ciphertext* a, const Ciphertext* b,
     ret     = pt_decompress(a->c2, &pa2); if (ret) goto done;
     ret     = pt_decompress(b->c1, &pb1); if (ret) goto done;
     ret     = pt_decompress(b->c2, &pb2); if (ret) goto done;
-
-    ret = ecp_add_pts(&r1, &pa1, &pb1); if (ret) goto done;  // c1_out = c1_a + c1_b
-    ret = ecp_add_pts(&r2, &pa2, &pb2); if (ret) goto done;  // c2_out = c2_a + c2_b
-
-    ret = pt_compress(&r1, out->c1); if (ret) goto done;
-    ret = pt_compress(&r2, out->c2);
+    ret = pt_add(&r1, &pa1, &pb1); if (ret) goto done;
+    ret = pt_add(&r2, &pa2, &pb2); if (ret) goto done;
+    ret = pt_compress(&r1, out->c1);
+    if (ret == 0) ret = pt_compress(&r2, out->c2);
 
 done:
     mbedtls_ecp_point_free(&pa1); mbedtls_ecp_point_free(&pa2);
@@ -354,349 +242,355 @@ done:
     return ret;
 }
 
-
 // =============================================================================
-// SECTION 7 — HOMOMORPHIC OPERATORS
+// Hot path: fused row-sum + decrypt
 // =============================================================================
 
-// sum_row — compute Enc(Σ row[i]·state[i]) for a PROGMEM enablement row.
-//
-// This is the core HE operation: given an encrypted state vector and a binary
-// row from the enablement matrix, compute the encrypted dot product.
-// The result is Enc(1) if any enabled state is active, Enc(0) otherwise.
-// We then decrypt just this single scalar — the state vector stays encrypted.
-static int sum_row(const std::vector<Ciphertext>& enc,
-                   const int8_t* row_pm,   // PROGMEM pointer to enablement row
-                   int n,
-                   Ciphertext* out) {
-    // Find the first state with enable=1 to initialise the accumulator.
-    int first = -1, cnt = 0;
-    for (int i = 0; i < n; ++i)
-        if (pm_i8(row_pm, i)) { if (first < 0) first = i; ++cnt; }
+// Computes (homomorphically OR'd over enabled non-zero cells of sv.enc) then
+// decrypts the result, all on the persistent decompressed cache so no point
+// decompression happens here. Returns:
+//   *out         : 0 or 1
+//   *did_decrypt : false if the row sum was trivially Enc(0), true otherwise
+static int row_decrypt(const Supervisor& sv, const int8_t* row, int n,
+                       int* out, bool* did_decrypt) {
+    *did_decrypt = false;
 
-    if (cnt == 0) {
-        // No enabled states → result is Enc(0).
-        memcpy(out, &g_zero, sizeof(Ciphertext));
-        return 0;
-    }
-
-    // Start with enc[first] (plain copy — no EC operation needed).
-    *out = enc[first];
-
-    // Add remaining enabled state ciphertexts homomorphically.
-    bool skip = true;
+    int first = -1;
     for (int i = 0; i < n; ++i) {
-        if (!pm_i8(row_pm, i)) continue;
-        if (skip) { skip = false; continue; }  // already used enc[first]
-        Ciphertext tmp;
-        int ret = elgamal_add_ct(out, &enc[i], &tmp);
-        if (ret) return ret;
-        *out = tmp;
+        if (!pm_i8(row, i))           continue;
+        if (is_g_zero(sv.enc[i]))     continue;
+        first = i; break;
     }
+    if (first < 0) { *out = 0; return 0; }
+
+    mbedtls_ecp_point s1, s2, tmp;
+    mbedtls_ecp_point_init(&s1);
+    mbedtls_ecp_point_init(&s2);
+    mbedtls_ecp_point_init(&tmp);
+
+    int ret = mbedtls_ecp_copy(&s1, &sv.dec_c1[first]); if (ret) goto done;
+    ret     = mbedtls_ecp_copy(&s2, &sv.dec_c2[first]); if (ret) goto done;
+
+    for (int i = first + 1; i < n; ++i) {
+        if (!pm_i8(row, i))           continue;
+        if (is_g_zero(sv.enc[i]))     continue;
+
+        ret = mbedtls_ecp_muladd(&g_grp, &tmp, &g_one, &s1, &g_one, &sv.dec_c1[i]);
+        if (ret) goto done;
+        swap_pt(&s1, &tmp);
+        ret = mbedtls_ecp_muladd(&g_grp, &tmp, &g_one, &s2, &g_one, &sv.dec_c2[i]);
+        if (ret) goto done;
+        swap_pt(&s2, &tmp);
+    }
+
+    // pm = (N-priv)*s1 + 1*s2   — single muladd: scalar mul + final add fused.
+    {
+        mbedtls_ecp_point pm;
+        mbedtls_ecp_point_init(&pm);
+        ret = mbedtls_ecp_muladd(&g_grp, &pm, &g_neg_priv, &s1, &g_one, &s2);
+        if (ret == 0) {
+            *out = mbedtls_ecp_is_zero(&pm) ? 0 : 1;
+            *did_decrypt = true;
+        }
+        mbedtls_ecp_point_free(&pm);
+    }
+
+done:
+    mbedtls_ecp_point_free(&s1);
+    mbedtls_ecp_point_free(&s2);
+    mbedtls_ecp_point_free(&tmp);
+    return ret;
+}
+
+// Apply event ev_gi's transitions to sv. Updates both the compressed
+// ciphertext array and the persistent decompressed cache in lock-step.
+static void do_transition(Supervisor& sv, int ev_gi, int n) {
+    int      off = trans_offset(sv.desc, ev_gi);
+    uint16_t pc  = pm_u16(sv.desc->tcnt, ev_gi);
+
+    std::vector<Ciphertext>        nxt(n, g_zero);
+    std::vector<mbedtls_ecp_point> nxt_c1(n), nxt_c2(n);
+    for (int i = 0; i < n; ++i) {
+        mbedtls_ecp_point_init(&nxt_c1[i]);
+        mbedtls_ecp_point_init(&nxt_c2[i]);
+    }
+
+    for (uint16_t p = 0; p < pc; ++p) {
+        int from = pm_i16(sv.desc->trans + off * 2, p * 2);
+        int to   = pm_i16(sv.desc->trans + off * 2, p * 2 + 1);
+        nxt[to]  = sv.enc[from];
+        if (!is_g_zero(sv.enc[from])) {
+            // Deep-copy the already-decompressed point — far cheaper than
+            // re-running pt_decompress on the target cell.
+            mbedtls_ecp_copy(&nxt_c1[to], &sv.dec_c1[from]);
+            mbedtls_ecp_copy(&nxt_c2[to], &sv.dec_c2[from]);
+        }
+    }
+
+    sv_free_dec(sv);
+    sv.enc    = std::move(nxt);
+    sv.dec_c1 = std::move(nxt_c1);
+    sv.dec_c2 = std::move(nxt_c2);
+}
+
+// =============================================================================
+// Parallel decrypt engine
+// =============================================================================
+
+// Process work units [start, end). On the worker core we yield once per unit
+// so IDLE0 can feed the Task Watchdog.
+static void process_work_range(int start, int end,
+                                const std::vector<WorkUnit>& work,
+                                int* dec_count) {
+    bool worker_core = (xPortGetCoreID() == CORE_WORKER);
+    for (int wi = start; wi < end; ++wi) {
+        if (worker_core) vTaskDelay(pdMS_TO_TICKS(1));
+        const WorkUnit& w = work[wi];
+        Supervisor& sv = g_sups[w.sv];
+        int n  = (int)pgm_read_word(&sv.desc->num_states);
+        int gi = sv.constrained_gi[w.li];
+
+        int e; bool did_decrypt;
+        if (row_decrypt(sv, sv.desc->enable + gi * n, n, &e, &did_decrypt) != 0) continue;
+        if (did_decrypt) (*dec_count)++;
+        sv.cached_en[w.li] = (int8_t)e;
+    }
+}
+
+static void persistent_worker_task(void*) {
+    for (;;) {
+        xSemaphoreTake(g_worker_go, portMAX_DELAY);
+        int local_dec = 0;
+        process_work_range(g_wcmd.start, g_wcmd.end, *g_wcmd.work, &local_dec);
+        portENTER_CRITICAL(&g_dec_mux);
+        g_step_decrypts += local_dec;
+        portEXIT_CRITICAL(&g_dec_mux);
+        xSemaphoreGive(g_worker_done);
+    }
+}
+
+// Split work in half between the two cores, then join.
+static void dispatch_parallel(const std::vector<WorkUnit>& work) {
+    if (work.empty()) return;
+
+    if (g_dual_core) {
+        int mid = (int)work.size() / 2;
+        g_wcmd.start = mid;
+        g_wcmd.end   = (int)work.size();
+        g_wcmd.work  = &work;
+        xSemaphoreGive(g_worker_go);
+
+        int main_dec = 0;
+        process_work_range(0, mid, work, &main_dec);
+        g_step_decrypts += main_dec;
+
+        xSemaphoreTake(g_worker_done, portMAX_DELAY);
+    } else {
+        int main_dec = 0;
+        process_work_range(0, (int)work.size(), work, &main_dec);
+        g_step_decrypts += main_dec;
+    }
+}
+
+// =============================================================================
+// Homomorphic step
+// =============================================================================
+
+static int he_step(int ev_gi, std::vector<int>& en_out) {
+    en_out.assign(EVENT_COUNT, 1);
+
+    // Phase 1 (main core, serial): apply transitions, build work list. A row
+    // is enqueued only if its current cached value could actually flip.
+    static std::vector<WorkUnit> work;
+    work.clear();
+    for (size_t i = 0; i < g_sups.size(); ++i) {
+        Supervisor& sv = g_sups[i];
+        if (!(sv.trans_event_mask & (1u << ev_gi))) continue;     // cached values still valid
+        int n = (int)pgm_read_word(&sv.desc->num_states);
+        do_transition(sv, ev_gi, n);
+        for (uint8_t li : sv.changes_if_zero[ev_gi])
+            if (sv.cached_en[li] == 0) work.push_back({(uint8_t)i, li});
+        for (uint8_t li : sv.changes_if_one[ev_gi])
+            if (sv.cached_en[li] == 1) work.push_back({(uint8_t)i, li});
+    }
+
+    // Phase 2: parallel decrypt across both cores.
+    dispatch_parallel(work);
+
+    // Phase 3: emit en_out from cached_en.
+    for (auto& sv : g_sups)
+        for (size_t li = 0; li < sv.constrained_gi.size(); ++li)
+            if (!sv.cached_en[li]) en_out[sv.constrained_gi[li]] = 0;
+
     return 0;
 }
 
-// sparse_transition — apply one event's transitions to the encrypted state vector.
-//
-// Reads (from, to) pairs from PROGMEM and copies ciphertexts: enc_new[to] = enc[from].
-// States with no incoming transition are filled with g_zero = Enc(0).
-// This is equivalent to: enc_new = B · enc  where B is the sparse transition matrix.
-// No decryption or EC arithmetic needed — just ciphertext copies.
-static int sparse_transition(std::vector<Ciphertext>& enc,
-                              const int16_t* trans_pm,  // PROGMEM (from,to) pairs
-                              uint16_t pair_count,
-                              int n) {
-    // Build the new state vector, starting with all Enc(0).
-    std::vector<Ciphertext> nxt(n, g_zero);
-
-    // Copy enc[from] → nxt[to] for each transition pair.
-    for (uint16_t p = 0; p < pair_count; ++p) {
-        int from = pm_i16(trans_pm, p * 2);
-        int to   = pm_i16(trans_pm, p * 2 + 1);
-        nxt[to]  = enc[from];
-    }
-
-    enc = std::move(nxt);
-    return 0;
-}
-
-
 // =============================================================================
-// SECTION 8 — LOAD SUPERVISORS
+// Supervisor loading and invariance precomputation
 // =============================================================================
 
-// Compute the element index (not byte offset) of the first pair for event ev_gi
-// in the flat transition array. Each (from, to) pair occupies 2 elements.
-static int trans_offset_for_event(const SupDesc* d, int ev_gi) {
-    int offset = 0;
-    for (int i = 0; i < ev_gi; ++i)
-        offset += (int)pm_u16(d->tcnt, i);   // sum pair counts for all earlier events
-    return offset * 2;   // ×2 because each pair = 2 int16_t elements
-}
-
-// Load supervisors from a PROGMEM SupDesc array into g_sups.
-// Builds bitmasks and constrained_gi lists for fast per-step lookups.
 static bool load_supervisors(const SupDesc* descs, int count) {
     g_sups.clear();
     g_sups.resize(count);
 
     for (int i = 0; i < count; ++i) {
         Supervisor& sv = g_sups[i];
-        sv.desc        = &descs[i];
-        sv.cache_valid = false;
-
+        sv.desc = &descs[i];
         int n = (int)pgm_read_word(&descs[i].num_states);
 
-        sv.own_event_mask    = 0;
-        sv.trans_event_mask  = 0;
-        sv.constraining_mask = 0;
-        sv.constrained_gi.clear();
-
-        // Scan all events once to build bitmasks and constrained_gi.
+        // Build event masks and the constrained_gi list.
         for (int gi = 0; gi < EVENT_COUNT; ++gi) {
-            // Transition bitmask: does this event have any transition here?
-            uint16_t tc = pm_u16(descs[i].tcnt, gi);
-            if (tc > 0) {
+            if (pm_u16(descs[i].tcnt, gi) > 0) {
                 sv.own_event_mask   |= (1u << gi);
                 sv.trans_event_mask |= (1u << gi);
             }
-
-            // Constraining bitmask: does this event have any disabled state?
-            // (i.e., at least one 0 in the enablement row for this event)
             bool constrains = false;
             for (int s = 0; s < n && !constrains; ++s)
                 if (!pm_i8(descs[i].enable, gi * n + s)) constrains = true;
-
             if (constrains) {
-                sv.own_event_mask    |= (1u << gi);
-                sv.constraining_mask |= (1u << gi);
+                sv.own_event_mask |= (1u << gi);
                 sv.constrained_gi.push_back((uint8_t)gi);
             }
         }
-
         sv.cached_en.assign(sv.constrained_gi.size(), 1);
+        sv.changes_if_zero.assign(EVENT_COUNT, {});
+        sv.changes_if_one .assign(EVENT_COUNT, {});
 
-        // Initialise shadow from PROGMEM initial state.
-        sv.shadow.resize(n);
-        for (int s = 0; s < n; ++s)
-            sv.shadow[s] = pm_i8(descs[i].init, s);
+        // Precompute the conditional-invariance lists per event.
+        //
+        // For row gi of this supervisor under event ev:
+        //   0 → 1 flip is possible iff some (f,t) has en_f=0 AND en_t=1
+        //                              (i.e. an outside state moves into A)
+        //   1 → 0 flip is possible iff some enabled state has no transition,
+        //                              or transitions to an outside state
+        for (int ev = 0; ev < EVENT_COUNT; ++ev) {
+            uint16_t pc = pm_u16(descs[i].tcnt, ev);
+            if (pc == 0) continue;
+            int off = trans_offset(&descs[i], ev);
 
-        // Print summary for this supervisor.
-        char name_buf[16];
-        strncpy_P(name_buf, (const char*)pgm_read_ptr(&descs[i].name), 15);
-        name_buf[15] = 0;
-        Serial.printf("[LOAD] %-10s  %3d states  %2d constraining ev  "
-                      "(%u bytes enc)\n",
-                      name_buf, n, (int)sv.constrained_gi.size(),
+            std::vector<uint8_t> in_from (n, 0);
+            std::vector<int16_t> trans_to(n, -1);
+            for (int p = 0; p < pc; ++p) {
+                int f = pm_i16(descs[i].trans + off * 2, p * 2);
+                int t = pm_i16(descs[i].trans + off * 2, p * 2 + 1);
+                in_from[f]  = 1;
+                trans_to[f] = (int16_t)t;
+            }
+
+            for (int li = 0; li < (int)sv.constrained_gi.size(); ++li) {
+                int gi = sv.constrained_gi[li];
+                const int8_t* row = descs[i].enable + gi * n;
+
+                // Rows with no enabled state are permanently 0.
+                bool any_en = false;
+                for (int s = 0; s < n && !any_en; ++s)
+                    if (pm_i8(row, s)) any_en = true;
+                if (!any_en) { sv.cached_en[li] = 0; continue; }
+
+                bool zero_to_one = false;
+                for (int p = 0; p < pc && !zero_to_one; ++p) {
+                    int f = pm_i16(descs[i].trans + off * 2, p * 2);
+                    int t = pm_i16(descs[i].trans + off * 2, p * 2 + 1);
+                    if (!pm_i8(row, f) && pm_i8(row, t)) zero_to_one = true;
+                }
+                if (zero_to_one) sv.changes_if_zero[ev].push_back((uint8_t)li);
+
+                bool one_to_zero = false;
+                for (int s = 0; s < n && !one_to_zero; ++s) {
+                    if (!pm_i8(row, s)) continue;
+                    if (!in_from[s])              { one_to_zero = true; break; }
+                    if (!pm_i8(row, trans_to[s])) { one_to_zero = true; break; }
+                }
+                if (one_to_zero) sv.changes_if_one[ev].push_back((uint8_t)li);
+            }
+        }
+
+        char name[16];
+        strncpy_P(name, (const char*)pgm_read_ptr(&descs[i].name), 15);
+        name[15] = 0;
+        Serial.printf("[LOAD] %-14s  %3d states  %2d constraining ev  (%u bytes enc)\n",
+                      name, n, (int)sv.constrained_gi.size(),
                       (unsigned)(n * sizeof(Ciphertext)));
     }
     return true;
 }
 
-
 // =============================================================================
-// SECTION 9 — STATE INITIALISATION
+// Initial encryption and cache warm-up
 // =============================================================================
 
-// Encrypt every supervisor's initial state vector into g_sups[i].enc.
-// Prints heap usage before/after to help diagnose out-of-memory errors.
-// Calls yield() between individual encryptions so the RTOS watchdog does not
-// fire and fragmented heap gets a chance to compact between EC operations.
 static bool init_states() {
     Serial.printf("[MEM] Heap before encryption: %u bytes free\n",
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
 
     for (size_t i = 0; i < g_sups.size(); ++i) {
         Supervisor& sv = g_sups[i];
-        sv.cache_valid = false;
         int n = (int)pgm_read_word(&sv.desc->num_states);
+
         sv.enc.resize(n);
-
-        char name_buf[16];
-        strncpy_P(name_buf, (const char*)pgm_read_ptr(&sv.desc->name), 15);
-        name_buf[15] = 0;
-
-        Serial.printf("[ENC] '%s' (%d states, %u bytes)... heap=%u\n",
-                      name_buf, n, (unsigned)(n * sizeof(Ciphertext)),
-                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
-
+        sv_free_dec(sv);
+        sv.dec_c1.resize(n);
+        sv.dec_c2.resize(n);
         for (int s = 0; s < n; ++s) {
-            yield();   // let RTOS reclaim fragmented heap between EC operations
-            int8_t v     = pm_i8(sv.desc->init, s);
-            sv.shadow[s] = v;   // keep shadow in sync with enc
-            int ret = elgamal_encrypt((int)v, &sv.enc[s]);
-            if (ret) {
-                Serial.printf("[ERROR] Encrypt failed: '%s' state %d "
-                              "(ret=-0x%04X, heap=%u)\n",
-                              name_buf, s, -ret,
-                              (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+            mbedtls_ecp_point_init(&sv.dec_c1[s]);
+            mbedtls_ecp_point_init(&sv.dec_c2[s]);
+        }
+
+        char name[16];
+        strncpy_P(name, (const char*)pgm_read_ptr(&sv.desc->name), 15);
+        name[15] = 0;
+        for (int s = 0; s < n; ++s) {
+            yield();
+            if (elgamal_enc((int)pm_i8(sv.desc->init, s), &sv.enc[s], &g_drbg) != 0) {
+                Serial.printf("[ERROR] Encrypt failed: '%s' state %d\n", name, s);
                 return false;
             }
+            // Populate the persistent decompressed cache immediately.
+            pt_decompress(sv.enc[s].c1, &sv.dec_c1[s]);
+            pt_decompress(sv.enc[s].c2, &sv.dec_c2[s]);
         }
-        Serial.printf("[ENC] '%s' OK  heap=%u\n", name_buf,
+        Serial.printf("[ENC] '%s' OK  heap=%u\n", name,
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
     }
-
     Serial.printf("[MEM] Heap after encryption: %u bytes free\n\n",
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
     return true;
 }
 
-// Warm the enablement cache by HE-decrypting the initial enablement for all
-// constraining events. After this, cache_valid = true for every supervisor.
-static bool warm_cache() {
-    for (size_t i = 0; i < g_sups.size(); ++i) {
-        Supervisor& sv = g_sups[i];
-        int n          = (int)pgm_read_word(&sv.desc->num_states);
-
-        for (int li = 0; li < (int)sv.constrained_gi.size(); ++li) {
-            int gi = sv.constrained_gi[li];
-            Ciphertext rs;
-            int ret = sum_row(sv.enc, sv.desc->enable + gi * n, n, &rs);
-            if (ret) return false;
-            int e;
-            ret = elgamal_decrypt(&rs, &e);
-            if (ret) return false;
-            sv.cached_en[li] = (int8_t)e;
-        }
-        sv.cache_valid = true;
-    }
-    return true;
+// Compute initial cached_en for every (sv, row) by running the parallel engine.
+static void warm_cache() {
+    std::vector<WorkUnit> work;
+    for (size_t i = 0; i < g_sups.size(); ++i)
+        for (size_t li = 0; li < g_sups[i].constrained_gi.size(); ++li)
+            work.push_back({(uint8_t)i, (uint8_t)li});
+    dispatch_parallel(work);
 }
 
-
 // =============================================================================
-// SECTION 10 — HOMOMORPHIC STEP
+// Oracle — cleartext reference for verification
 // =============================================================================
-//
-// Process one simulation event homomorphically.
-//
-// For each supervisor:
-//   1. If the event is not in the supervisor's alphabet → apply cached result.
-//   2. If the event is owned but has no transition AND the cache is valid →
-//      state is unchanged → apply cached result (no HE work).
-//   3. Otherwise:
-//      a. Update shadow via the same sparse transition (cleartext).
-//      b. Update enc via sparse_transition (ciphertext copies, no decrypt).
-//      c. For each constraining event:
-//           - If shadow shows exactly 1 active state → read enablement from
-//             PROGMEM directly (zero EC operations).
-//           - If shadow shows 0 active states → disabled (should not happen).
-//           - If shadow shows >1 active states → HE-decrypt (fallback).
-
-static int he_step(int ev_gi, std::vector<int>& en_out) {
-    en_out.assign(EVENT_COUNT, 1);   // start with all events enabled
-
-    for (size_t i = 0; i < g_sups.size(); ++i) {
-        Supervisor& sv = g_sups[i];
-
-        // Convenience lambda: push cached enablement results into en_out.
-        auto apply_cache = [&]() {
-            for (int li = 0; li < (int)sv.constrained_gi.size(); ++li)
-                if (!sv.cached_en[li]) en_out[sv.constrained_gi[li]] = 0;
-        };
-
-        bool ev_owned  = (ev_gi >= 0) && (sv.own_event_mask  & (1u << ev_gi));
-        bool has_trans = (ev_gi >= 0) && (sv.trans_event_mask & (1u << ev_gi));
-
-        // ── Fast path: event not owned, or owned but no state change ─────────
-        if (!ev_owned || (!has_trans && sv.cache_valid)) {
-            if (sv.cache_valid) apply_cache();
-            continue;
-        }
-
-        sv.cache_valid = false;
-        int n = (int)pgm_read_word(&sv.desc->num_states);
-
-        // ── Apply transitions ─────────────────────────────────────────────────
-        if (has_trans) {
-            int      off = trans_offset_for_event(sv.desc, ev_gi);
-            uint16_t pc  = pm_u16(sv.desc->tcnt, ev_gi);
-
-            // Update shadow (cleartext) — same logic as the encrypted transition.
-            std::vector<int8_t> shadow_nxt(n, 0);
-            for (uint16_t p = 0; p < pc; ++p) {
-                int from = pm_i16(sv.desc->trans + off, p * 2);
-                int to   = pm_i16(sv.desc->trans + off, p * 2 + 1);
-                shadow_nxt[to] = sv.shadow[from];
-            }
-            sv.shadow = std::move(shadow_nxt);
-
-            // Update encrypted state (ciphertext copies — no decryption).
-            int ret = sparse_transition(sv.enc, sv.desc->trans + off, pc, n);
-            if (ret) return ret;
-        }
-
-        // ── Check enablement for each constraining event ──────────────────────
-        for (int li = 0; li < (int)sv.constrained_gi.size(); ++li) {
-            int gi = sv.constrained_gi[li];
-
-            // Count active states in the shadow.
-            int active_count = 0, active_state = -1;
-            for (int s = 0; s < n; ++s)
-                if (sv.shadow[s]) { active_count++; active_state = s; }
-
-            int e;
-#if FORCE_HE_DECRYPT
-            if (false) {
-#else
-            if (active_count == 1) {
-#endif
-                // One-hot state (normal case): read enablement from PROGMEM.
-                // No EC operations at all — just a table lookup in flash.
-                e = (int)pm_i8(sv.desc->enable, gi * n + active_state);
-            } else if (active_count == 0) {
-                e = 0;   // no active state — treat as disabled (defensive)
-            } else {
-                // Multiple active states — must HE-decrypt the full row.
-                // This should not occur in a deterministic DES supervisor.
-                Ciphertext rs;
-                int ret = sum_row(sv.enc, sv.desc->enable + gi * n, n, &rs);
-                if (ret) return ret;
-                ret = elgamal_decrypt(&rs, &e);
-                if (ret) return ret;
-            }
-
-            sv.cached_en[li] = (int8_t)e;
-            if (!e) en_out[gi] = 0;
-        }
-        sv.cache_valid = true;
-    }
-    return 0;
-}
-
-
-// =============================================================================
-// SECTION 11 — ORACLE (cleartext reference)
-// =============================================================================
-// Runs the same simulation in pure cleartext — never timed, only used to
-// verify that the HE result matches the expected (correct) result each step.
 
 struct Oracle {
-    std::vector<std::vector<int>> st;   // cleartext state per supervisor
+    std::vector<std::vector<int>> st;
 
     void init(const SupDesc* descs, int count) {
         st.resize(count);
         for (int i = 0; i < count; ++i) {
             int n = (int)pgm_read_word(&descs[i].num_states);
             st[i].resize(n);
-            for (int s = 0; s < n; ++s)
-                st[i][s] = pm_i8(descs[i].init, s);
+            for (int s = 0; s < n; ++s) st[i][s] = pm_i8(descs[i].init, s);
         }
     }
 
     std::vector<int> step(int ev_gi, const SupDesc* descs, int count) {
         std::vector<int> en(EVENT_COUNT, 1);
-
         for (int i = 0; i < count; ++i) {
             int n = (int)pgm_read_word(&descs[i].num_states);
 
-            // Apply transition for ev_gi (if any).
+            // Apply transitions
             uint16_t pc = pm_u16(descs[i].tcnt, ev_gi);
             if (pc > 0) {
-                int off = 0;
-                for (int gi = 0; gi < ev_gi; ++gi)
-                    off += (int)pm_u16(descs[i].tcnt, gi);
+                int off = trans_offset(&descs[i], ev_gi);
                 std::vector<int> nxt(n, 0);
                 for (uint16_t p = 0; p < pc; ++p) {
                     int from = pm_i16(descs[i].trans, (off + p) * 2);
@@ -706,30 +600,27 @@ struct Oracle {
                 st[i] = nxt;
             }
 
-            // Compute enablement for all constraining events.
-            if (g_sups[i].own_event_mask == 0) continue;
+            // Emit constraints
+            if (!g_sups[i].own_event_mask) continue;
             for (int gi = 0; gi < EVENT_COUNT; ++gi) {
                 if (!(g_sups[i].own_event_mask & (1u << gi))) continue;
                 bool constrains = false;
                 for (int s = 0; s < n && !constrains; ++s)
                     if (!pm_i8(descs[i].enable, gi * n + s)) constrains = true;
                 if (!constrains) continue;
-                int e = 0;
+                bool enabled = false;
                 for (int s = 0; s < n; ++s)
-                    if (pm_i8(descs[i].enable, gi * n + s) && st[i][s]) { e = 1; break; }
-                if (!e) en[gi] = 0;
+                    if (pm_i8(descs[i].enable, gi * n + s) && st[i][s]) { enabled = true; break; }
+                if (!enabled) en[gi] = 0;
             }
         }
         return en;
     }
 };
 
-
 // =============================================================================
-// SECTION 12 — SELF-TEST
+// Self-test
 // =============================================================================
-// Verifies the EC-ElGamal implementation before any benchmark runs.
-// If any check fails, setup() halts with an error message.
 
 static bool run_selftest() {
     Serial.println("============================================");
@@ -737,61 +628,44 @@ static bool run_selftest() {
     Serial.println("============================================");
     bool ok = true;
 
-    // Test 1: Basic encrypt / decrypt correctness.
     Ciphertext ct0, ct1;
-    elgamal_encrypt(0, &ct0);
-    elgamal_encrypt(1, &ct1);
+    elgamal_enc(0, &ct0, &g_drbg);
+    elgamal_enc(1, &ct1, &g_drbg);
     int d0 = -1, d1 = -1;
-    elgamal_decrypt(&ct0, &d0);
-    elgamal_decrypt(&ct1, &d1);
-    Serial.printf("  [1] Enc(0)->Dec=%d  Enc(1)->Dec=%d  %s\n",
-                  d0, d1, (d0==0 && d1==1) ? "PASS" : "FAIL");
-    if (d0 != 0 || d1 != 1) ok = false;
+    elgamal_dec(&ct0, &d0);
+    elgamal_dec(&ct1, &d1);
+    bool t1 = (d0 == 0 && d1 == 1); ok &= t1;
+    Serial.printf("  [1] Enc(0)->%d  Enc(1)->%d  %s\n", d0, d1, t1 ? "PASS" : "FAIL");
 
-    // Test 2: Homomorphic add — Enc(1)+Enc(1) should decrypt to non-zero.
-    Ciphertext cs11; elgamal_add_ct(&ct1, &ct1, &cs11);
-    int ds11 = -1; elgamal_decrypt(&cs11, &ds11);
-    Serial.printf("  [2] Enc(1)+Enc(1)->Dec=%d (expect 1)  %s\n",
-                  ds11, ds11==1 ? "PASS" : "FAIL");
-    if (ds11 != 1) ok = false;
+    Ciphertext cs; int ds = -1;
+    elgamal_add(&ct1, &ct1, &cs); elgamal_dec(&cs, &ds);
+    bool t2 = (ds == 1); ok &= t2;
+    Serial.printf("  [2] Enc(1)+Enc(1)->%d  %s\n", ds, t2 ? "PASS" : "FAIL");
 
-    // Test 3: Homomorphic add — Enc(0)+Enc(0) should decrypt to 0.
-    Ciphertext cs00; elgamal_add_ct(&ct0, &ct0, &cs00);
-    int ds00 = -1; elgamal_decrypt(&cs00, &ds00);
-    Serial.printf("  [3] Enc(0)+Enc(0)->Dec=%d (expect 0)  %s\n",
-                  ds00, ds00==0 ? "PASS" : "FAIL");
-    if (ds00 != 0) ok = false;
+    elgamal_add(&ct0, &ct0, &cs); ds = -1; elgamal_dec(&cs, &ds);
+    bool t3 = (ds == 0); ok &= t3;
+    Serial.printf("  [3] Enc(0)+Enc(0)->%d  %s\n", ds, t3 ? "PASS" : "FAIL");
 
-    // Test 4: Non-determinism — two separate Enc(1) must have different c1
-    //         (same c1 would mean the random nonce r was reused — RNG broken).
-    Ciphertext ct1b; elgamal_encrypt(1, &ct1b);
-    bool same = (memcmp(ct1.c1, ct1b.c1, PT_LEN) == 0);
-    Serial.printf("  [4] Two Enc(1) have distinct c1: %s\n",
-                  !same ? "PASS" : "FAIL (RNG may be broken)");
-    if (same) ok = false;
+    Ciphertext ct1b; elgamal_enc(1, &ct1b, &g_drbg);
+    bool t4 = (memcmp(ct1.c1, ct1b.c1, PT_LEN) != 0); ok &= t4;
+    Serial.printf("  [4] Two Enc(1) have distinct c1: %s\n", t4 ? "PASS" : "FAIL");
 
-    // Test 5: Compress → decompress round-trip on the generator point G.
     uint8_t buf[PT_LEN]; size_t len = 0;
-    mbedtls_ecp_point_write_binary(&g_grp, &g_G,
-        MBEDTLS_ECP_PF_COMPRESSED, &len, buf, PT_LEN);
-    mbedtls_ecp_point P2;
+    mbedtls_ecp_point_write_binary(&g_grp, &g_G, MBEDTLS_ECP_PF_COMPRESSED, &len, buf, PT_LEN);
+    mbedtls_ecp_point P2; mbedtls_ecp_point_init(&P2);
     mbedtls_ecp_point_read_binary(&g_grp, &P2, buf, PT_LEN);
-    int eq = mbedtls_ecp_point_cmp(&P2, &g_G);
+    bool t5 = (mbedtls_ecp_point_cmp(&P2, &g_G) == 0); ok &= t5;
     mbedtls_ecp_point_free(&P2);
-    Serial.printf("  [5] Compress/decompress G: %s\n",
-                  eq==0 ? "PASS" : "FAIL");
-    if (eq != 0) ok = false;
+    Serial.printf("  [5] Compress/decompress G: %s\n", t5 ? "PASS" : "FAIL");
 
-    Serial.printf("  Curve          : secp256k1\n");
-    Serial.printf("  Ciphertext size: %u bytes (2 × %d-byte compressed points)\n",
-                  (unsigned)sizeof(Ciphertext), PT_LEN);
-    Serial.printf("  Self-test      : %s\n\n", ok ? "PASS" : "FAIL");
+    Serial.printf("  Curve: %s  |  CT size: %u bytes  |  Dual-core: %s\n",
+                  CURVE_NAME, (unsigned)sizeof(Ciphertext), g_dual_core ? "YES" : "NO");
+    Serial.printf("  Result: %s\n\n", ok ? "PASS" : "FAIL");
     return ok;
 }
 
-
 // =============================================================================
-// SECTION 13 — BENCHMARK
+// Benchmark driver
 // =============================================================================
 
 static void print_vec(const std::vector<int>& v) {
@@ -803,94 +677,129 @@ static void print_vec(const std::vector<int>& v) {
 static void run_benchmark(const char* label, const SupDesc* descs, int count) {
     Serial.println("============================================");
     Serial.printf("  BENCHMARK: %s\n", label);
+    Serial.printf("  Cores used: %s\n",
+                  (g_dual_core && count > 1) ? "BOTH (dual-core)" : "1 (single)");
     Serial.println("============================================");
 
-    // Load and print supervisor summaries.
     load_supervisors(descs, count);
     Serial.println();
+    if (!init_states())  { Serial.println("[FATAL] Encryption failed."); while(true) delay(1000); }
 
-    // Encrypt initial states.
-    if (!init_states()) {
-        Serial.println("[FATAL] Encryption failed — halting.");
-        while (true) delay(1000);
-    }
+    Serial.print("Warming enablement cache... ");
+    long tw = millis();
+    warm_cache();
+    Serial.printf("OK (%ld ms)\n\n", millis() - tw);
 
-    // Warm the enablement cache via HE decryption.
-    Serial.println("Warming enablement cache...");
-    if (!warm_cache()) {
-        Serial.println("[FATAL] Cache warm failed — halting.");
-        while (true) delay(1000);
-    }
-    Serial.println("Cache warm OK.\n");
-
-    Oracle oracle;
-    oracle.init(descs, count);
-
-    // Timing accumulators (all in microseconds — micros() resolution is 1 ms).
-    long total_ms = 0, min_ms = LONG_MAX, max_ms = 0;
-    int  total_decrypts = 0;
-    bool all_ok = true;
+    Oracle oracle; oracle.init(descs, count);
+    uint64_t total_us = 0, min_us = UINT64_MAX, max_us = 0;
+    int  total_dec = 0;
+    bool all_ok    = true;
 
     for (int step = 0; step < SIM_SEQ_LEN; ++step) {
         int ev_gi = (int)pm_u16(SIM_SEQ, step);
+        char ev[16];
+        strncpy_P(ev, (const char*)pgm_read_ptr(&EVENT_NAMES[ev_gi]), 15);
+        ev[15] = 0;
+        Serial.printf("-- Step %d | Event: %s --\n", step + 1, ev);
 
-        char ev_buf[16];
-        strncpy_P(ev_buf, pm_event_name(ev_gi), 15);
-        ev_buf[15] = 0;
-        Serial.printf("-- Step %d | Event: %s --\n", step + 1, ev_buf);
-
-        // Run oracle (cleartext, not timed).
         std::vector<int> oracle_en = oracle.step(ev_gi, descs, count);
-
-        // Run HE step (timed).
         std::vector<int> he_en;
         g_step_decrypts = 0;
-        long t0      = millis();
-        int  ret     = he_step(ev_gi, he_en);
-        long step_ms = millis() - t0;
+        uint64_t t0      = (uint64_t)esp_timer_get_time();
+        int      ret     = he_step(ev_gi, he_en);
+        uint64_t step_us = (uint64_t)esp_timer_get_time() - t0;
 
-        total_ms    += step_ms;
-        total_decrypts += g_step_decrypts;
-        if (step_ms < min_ms) min_ms = step_ms;
-        if (step_ms > max_ms) max_ms = step_ms;
+        total_us  += step_us;
+        total_dec += g_step_decrypts;
+        if (step_us < min_us) min_us = step_us;
+        if (step_us > max_us) max_us = step_us;
+        if (ret) { Serial.printf("  HE ERROR -0x%04X\n", -ret); all_ok = false; continue; }
 
-        if (ret) {
-            Serial.printf("  HE ERROR -0x%04X\n", -ret);
-            all_ok = false;
-            continue;
-        }
-
-        Serial.print("  [Oracle] "); print_vec(oracle_en); Serial.println();
-        Serial.print("  [HE]     "); print_vec(he_en);     Serial.println();
         bool ok = (he_en == oracle_en);
         if (!ok) all_ok = false;
-        Serial.printf("  Time: %ld ms  |  HE decrypts: %d  |  %s\n\n",
-                      step_ms, g_step_decrypts, ok ? "OK" : "FAIL");
+        Serial.print("  [Oracle] "); print_vec(oracle_en); Serial.println();
+        Serial.print("  [HE]     "); print_vec(he_en);     Serial.println();
+        Serial.printf("  Time: %.3f ms  |  Decrypts: %d  |  %s\n\n",
+                      step_us / 1000.0, g_step_decrypts, ok ? "OK" : "FAIL");
     }
 
     int ns = SIM_SEQ_LEN ? SIM_SEQ_LEN : 1;
     Serial.println("--------------------------------------------");
-    Serial.println("  TIMING SUMMARY");
-    Serial.println("--------------------------------------------");
-    Serial.printf("  Total HE time  : %ld ms  (%ld s)\n",
-                  total_ms, total_ms / 1000);
-    Serial.printf("  Avg  per step  : %ld ms\n", total_ms / ns);
-    Serial.printf("  Min  per step  : %ld ms\n", min_ms);
-    Serial.printf("  Max  per step  : %ld ms\n", max_ms);
-    Serial.printf("  Total HE decrypts: %d  (shadow skipped the rest)\n",
-                  total_decrypts);
-    Serial.printf("  Supervisors    : %d  (ALL encrypted)\n", count);
-    Serial.printf("  Result         : %s\n", all_ok ? "PASS" : "FAIL");
+    Serial.printf("  Total: %.3f ms | Avg: %.3f ms | Min: %.3f ms | Max: %.3f ms\n",
+                  total_us / 1000.0, (total_us / (double)ns) / 1000.0,
+                  min_us / 1000.0, max_us / 1000.0);
+    Serial.printf("  Total decrypts: %d | Supervisors: %d | Result: %s\n",
+                  total_dec, count, all_ok ? "PASS" : "FAIL");
     Serial.println("============================================\n");
 
-    // Free encrypted state vectors before next benchmark.
-    for (auto& sv : g_sups) sv.enc.clear();
+    for (auto& sv : g_sups) { sv_free_dec(sv); sv.enc.clear(); }
     g_sups.clear();
 }
 
+// =============================================================================
+// Setup helpers
+// =============================================================================
+
+// Initialise mbedTLS, load the curve, and generate the EC-ElGamal keypair.
+static void crypto_init() {
+    mbedtls_ecp_group_init(&g_grp);
+    mbedtls_ecp_point_init(&g_G);
+    mbedtls_ecp_point_init(&g_pub);
+    mbedtls_mpi_init(&g_priv);
+    mbedtls_mpi_init(&g_one);
+    mbedtls_mpi_init(&g_neg_priv);
+    mbedtls_ctr_drbg_init(&g_drbg);
+    mbedtls_entropy_init(&g_entropy);
+    mbedtls_mpi_lset(&g_one, 1);
+
+    const char* pers = "esp32_he";
+    mbedtls_ctr_drbg_seed(&g_drbg, mbedtls_entropy_func, &g_entropy,
+                           (const uint8_t*)pers, strlen(pers));
+    mbedtls_ecp_group_load(&g_grp, CURVE);
+    mbedtls_ecp_copy(&g_G, &g_grp.G);
+    mbedtls_ecp_gen_keypair(&g_grp, &g_priv, &g_pub,
+                             mbedtls_ctr_drbg_random, &g_drbg);
+    mbedtls_mpi_sub_mpi(&g_neg_priv, &g_grp.N, &g_priv);   // fixed for the run
+    elgamal_enc(0, &g_zero, &g_drbg);
+}
+
+// One-time measurement of mbedtls scalar mul / muladd cost for the build banner.
+static void report_crypto_speed() {
+    mbedtls_ecp_point P, Q, R; mbedtls_mpi k;
+    mbedtls_ecp_point_init(&P); mbedtls_ecp_point_init(&Q);
+    mbedtls_ecp_point_init(&R); mbedtls_mpi_init(&k);
+    mbedtls_ecp_copy(&P, &g_G); mbedtls_ecp_copy(&Q, &g_G);
+    mbedtls_mpi_lset(&k, 1);
+
+    long t0 = millis();
+    for (int i = 0; i < 5; ++i) mbedtls_ecp_muladd(&g_grp, &R, &k, &P, &k, &Q);
+    long muladd_ms = (millis() - t0) / 5;
+
+    t0 = millis();
+    for (int i = 0; i < 5; ++i)
+        mbedtls_ecp_mul(&g_grp, &R, &k, &g_G, mbedtls_ctr_drbg_random, &g_drbg);
+    long scalarmul_ms = (millis() - t0) / 5;
+
+    mbedtls_ecp_point_free(&P); mbedtls_ecp_point_free(&Q);
+    mbedtls_ecp_point_free(&R); mbedtls_mpi_free(&k);
+    Serial.printf("[Crypto] muladd=%ld ms  scalar_mul=%ld ms\n\n",
+                  muladd_ms, scalarmul_ms);
+}
+
+// Spawn the persistent worker on core 0. Returns true on success.
+static bool spawn_worker() {
+    g_worker_go   = xSemaphoreCreateBinary();
+    g_worker_done = xSemaphoreCreateBinary();
+    if (!g_worker_go || !g_worker_done) return false;
+
+    BaseType_t r = xTaskCreatePinnedToCore(
+        persistent_worker_task, "he_worker", WORKER_STACK,
+        NULL, WORKER_PRIO, NULL, CORE_WORKER);
+    return r == pdPASS;
+}
 
 // =============================================================================
-// SECTION 14 — SETUP & LOOP
+// Entry point
 // =============================================================================
 
 void setup() {
@@ -899,87 +808,33 @@ void setup() {
     Serial.println("\n============================================");
     Serial.println("  ESP32 Homomorphic DES  —  UltraDES");
     Serial.println("============================================");
-    Serial.printf("  EVENT_COUNT    : %d\n", EVENT_COUNT);
-    Serial.printf("  SIM_SEQ_LEN    : %d\n", SIM_SEQ_LEN);
-    Serial.printf("  Ciphertext     : %u bytes\n\n", (unsigned)sizeof(Ciphertext));
+    Serial.printf("  EVENT_COUNT : %d\n",      EVENT_COUNT);
+    Serial.printf("  SIM_SEQ_LEN : %d\n",      SIM_SEQ_LEN);
+    Serial.printf("  Ciphertext  : %u bytes\n\n", (unsigned)sizeof(Ciphertext));
 
-    // ── 1. Initialise mbedTLS ─────────────────────────────────────────────────
-    mbedtls_ecp_group_init(&g_grp);
-    mbedtls_ecp_point_init(&g_G);
-    mbedtls_ecp_point_init(&g_pub);
-    mbedtls_mpi_init(&g_priv);
-    mbedtls_mpi_init(&g_one);
-    mbedtls_ctr_drbg_init(&g_drbg);
-    mbedtls_entropy_init(&g_entropy);
-    mbedtls_mpi_lset(&g_one, 1);
+    crypto_init();
 
-    // Seed the RNG from the ESP32 hardware entropy source.
-    const char* pers = "esp32_he_des";
-    mbedtls_ctr_drbg_seed(&g_drbg, mbedtls_entropy_func, &g_entropy,
-                           (const uint8_t*)pers, strlen(pers));
+    g_dual_core = spawn_worker();
+    Serial.printf("[Dual-core] %s\n\n",
+                  g_dual_core ? "Worker on core 0" : "Failed — running single-core");
 
-    // Load secp256k1 curve and generate a fresh keypair.
-    mbedtls_ecp_group_load(&g_grp, CURVE);
-    mbedtls_ecp_copy(&g_G, &g_grp.G);
-    mbedtls_ecp_gen_keypair(&g_grp, &g_priv, &g_pub,
-                             mbedtls_ctr_drbg_random, &g_drbg);
+    report_crypto_speed();
 
-    // Pre-encrypt Enc(0) for use as the sparse-transition fill value.
-    elgamal_encrypt(0, &g_zero);
-
-    // ── 2. Measure EC operation timing ────────────────────────────────────────
-    {
-        mbedtls_ecp_point P, Q, R; mbedtls_mpi k;
-        mbedtls_ecp_point_init(&P); mbedtls_ecp_point_init(&Q);
-        mbedtls_ecp_point_init(&R); mbedtls_mpi_init(&k);
-        mbedtls_ecp_copy(&P, &g_G); mbedtls_ecp_copy(&Q, &g_G);
-        mbedtls_mpi_lset(&k, 1);
-        long t0 = millis();
-        for (int i = 0; i < 5; ++i)
-            mbedtls_ecp_muladd(&g_grp, &R, &k, &P, &k, &Q);
-        g_muladd_ms = (millis() - t0) / 5;
-        t0 = millis();
-        for (int i = 0; i < 5; ++i)
-            mbedtls_ecp_mul(&g_grp, &R, &k, &g_G,
-                             mbedtls_ctr_drbg_random, &g_drbg);
-        g_scalarmul_ms = (millis() - t0) / 5;
-        mbedtls_ecp_point_free(&P); mbedtls_ecp_point_free(&Q);
-        mbedtls_ecp_point_free(&R); mbedtls_mpi_free(&k);
-        Serial.printf("[Crypto] muladd=%ld ms  scalar_mul=%ld ms\n\n",
-                      g_muladd_ms, g_scalarmul_ms);
-    }
-
-    // ── 3. Self-test — must pass before any benchmark ─────────────────────────
-    g_step_decrypts = 0;   // clear self-test decrypt counts before benchmarks
     if (!run_selftest()) {
-        Serial.println("Self-test FAILED — halting. Check mbedTLS init.");
+        Serial.println("Self-test FAILED — halting.");
         while (true) delay(1000);
     }
 
-    // ── 4. Monolithic benchmark (skipped if notebook omitted it) ─────────────
 #if HAS_MONO
     run_benchmark("MONOLITHIC", &MONO_SUP, 1);
 #else
-    Serial.println("[SKIP] Monolithic supervisor not included "
-                   "(exceeded flash budget in notebook).\n");
+    Serial.println("[SKIP] Monolithic supervisor not included.\n");
 #endif
 
-    // ── 5. Local modular benchmark ────────────────────────────────────────────
-    run_benchmark("LOCAL MODULAR", LMOD_SUPS, LMOD_COUNT);
-
-    // ── 6. Local modular REDUCED benchmark ───────────────────────────────────
+    run_benchmark("LOCAL MODULAR",         LMOD_SUPS,     LMOD_COUNT);
     run_benchmark("LOCAL MODULAR REDUCED", LMOD_RED_SUPS, LMOD_RED_COUNT);
-
-    // ── 7. Cleanup mbedTLS resources ──────────────────────────────────────────
-    mbedtls_ecp_group_free(&g_grp);
-    mbedtls_ecp_point_free(&g_G);   mbedtls_ecp_point_free(&g_pub);
-    mbedtls_mpi_free(&g_priv);      mbedtls_mpi_free(&g_one);
-    mbedtls_ctr_drbg_free(&g_drbg); mbedtls_entropy_free(&g_entropy);
 
     Serial.println("All benchmarks complete.");
 }
 
-void loop() {
-    // Nothing to do — all work happens once in setup().
-    delay(10000);
-}
+void loop() { delay(10000); }
