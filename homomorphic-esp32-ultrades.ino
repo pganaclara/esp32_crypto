@@ -1,31 +1,72 @@
 // =============================================================================
-// ESP32 Homomorphic DES benchmark — EC-ElGamal on NIST P-192, dual-core FreeRTOS
+// ESP32 Homomorphic DES — privacy-preserving supervisor evaluation
 // =============================================================================
 //
-// The supervisor state lives only as EC-ElGamal ciphertexts in RAM. The active
-// state is never decrypted on the normal path — we homomorphically OR the
-// enabled cells of each constraining row and decrypt only the resulting bit.
+// Runs a Discrete Event System supervisor on an ESP32 with the plant state
+// held only as EC-ElGamal ciphertexts. Each step:
 //
-// Optimisations layered on top of the basic scheme:
-//   * Conditional invariance — at load time, for every (sup, event, row) we
-//     precompute whether the row can flip 0→1, 1→0, both, or neither. At
-//     runtime we re-decrypt only rows whose current cached value could
-//     actually change.
-//   * Persistent decompressed cache — each supervisor keeps its ciphertexts
-//     in BOTH compressed (Ciphertext, 50 B) and decompressed (mbedtls_ecp_point)
-//     form. do_transition maintains the cache via cheap mbedtls_ecp_copy
-//     instead of running pt_decompress (sqrt) on every read.
-//   * Skip-g_zero summands — after a transition most state cells are the
-//     literal global Enc(0) constant; sum_row skips them.
-//   * Fused row-sum + decrypt — a single mbedtls_ecp_muladd handles the secret
-//     scalar mul and the final add, eliminating the intermediate point.
-//   * Dual-core work-unit split — phase 1 (serial, main core) applies
-//     transitions and enqueues (sup, row) work units; phase 2 splits them
-//     across both cores via a persistent worker task on core 0.
+//   1. apply the fired event's transitions to the encrypted state vector
+//   2. homomorphically OR each constraining row's enabled cells
+//   3. decrypt only the resulting bit (one per row) to produce enablement
 //
-// Setup: drop a supervisor_data_<PROBLEM>.h + sdkconfig.ext in the sketch
-// folder, point the #include below at the .h file, flash, and open the Serial
-// Monitor at 115200 baud.
+// The state distribution itself is never decrypted on the normal run path.
+//
+// ── HOW TO RUN ───────────────────────────────────────────────────────────────
+//   1. Drop  supervisor_data_<PROBLEM>.h  AND  sdkconfig.ext  into this folder
+//   2. Update the #include below to match your .h file
+//   3. Flash, open Serial Monitor at 115200 baud
+//
+//   sdkconfig.ext is essential — it enables hardware MPI acceleration. Without
+//   it the firmware still works but is roughly 5× slower.
+//
+// ── HOW TO USE WITH A NEW DES PROBLEM ────────────────────────────────────────
+//   The companion notebook (generator_ultrades_mono_lmod_lmodred.ipynb) holds
+//   the plant and specification definitions. Pick a PROBLEM in Cell 3, define
+//   plants/specs in Cell 4 (copy one of the existing problems as a template),
+//   run the notebook, then copy the generated .h next to this sketch.
+//
+// ── SECURITY NOTES ───────────────────────────────────────────────────────────
+//   The crypto is real EC-ElGamal on NIST P-192 (~96-bit security level).
+//   Scalar blinding is always on — every decryption uses mbedtls_ecp_mul with
+//   a per-core DRBG callback, closing the timing/power side-channel on the
+//   private key. Measured cost is below 1 % on the ESP32-S3 hardware-MPI path.
+//
+//   One optional flag, SECURITY_FULL_RERANDOMIZE, additionally re-randomises
+//   every cell after each transition (closes the g_zero byte-equality and
+//   active-ciphertext-propagation memory-side-channel leaks). It's very
+//   expensive (~150 ms per cell) — see the comment at the flag's definition
+//   for details. Default OFF; turn it on only for comparison/research.
+//
+// Tested with Arduino ESP32 core v3.x on ESP32-WROOM-32 and ESP32-S3.
+// =============================================================================
+//
+// ── ARCHITECTURE (skip if you just want to run it) ───────────────────────────
+//
+// A step (he_step) runs in three phases:
+//
+//   PHASE 1 (main core, serial) — apply transitions & build work list
+//     For each supervisor whose trans_event_mask contains this event:
+//       a. do_transition() updates the encrypted state vector AND the
+//          persistent decompressed-point cache in lock-step.
+//       b. enqueue rows whose cached enablement could plausibly flip. The
+//          conditional-invariance lists (precomputed at load time) make this
+//          O(small) instead of "every row of every supervisor".
+//
+//   PHASE 2 (both cores, parallel) — decrypt the work units
+//     dispatch_parallel splits the work list in half. The main core handles
+//     the first half; a persistent worker task on core 0 (woken by semaphore)
+//     handles the other. Both call row_decrypt().
+//
+//   PHASE 3 (main core, serial) — emit en_out
+//     Walk every supervisor's cached_en[] and produce the global enable bitmap.
+//
+// Five optimisations stack to bring this from ~33 s/step (naive) to ~1 s/step:
+//
+//   1. Conditional invariance  — only re-decrypt rows that can actually flip
+//   2. Persistent decompressed cache — never run pt_decompress in the hot path
+//   3. Skip Enc(0) summands    — most cells are the literal g_zero constant
+//   4. Fused row-sum + decrypt — single mbedtls_ecp_muladd does both
+//   5. Dual-core work-unit split — phase 2 splits cleanly across both cores
 // =============================================================================
 
 #include <Arduino.h>
@@ -56,6 +97,31 @@
 #define CORE_WORKER  0
 #define WORKER_STACK 12288
 #define WORKER_PRIO  2                            // above IDLE(0), below system tasks
+
+// ── Security ────────────────────────────────────────────────────────────────
+//
+// Scalar blinding on decrypt is always on. mbedtls_ecp_mul is called with a
+// DRBG callback so the timing/power profile of the scalar mul does not leak
+// bits of the private key (paper: Brumley/Tuveri 2011, "Remote Timing
+// Attacks Are Still Practical"). Each core has its own DRBG context because
+// mbedTLS CTR-DRBG is not thread-safe. Measured overhead vs. unblinded fused
+// muladd: < 1 % — effectively free on the ESP32 hardware-MPI path.
+//
+// SECURITY_FULL_RERANDOMIZE (default OFF, EXPENSIVE — research comparison only)
+//     After every do_transition, replace every cell with a fresh random
+//     ciphertext that decrypts to the same plaintext. Closes the remaining
+//     two RAM/side-channel leaks:
+//       - g_zero byte-equality (non-active cells were byte-identical to the
+//         global Enc(0) constant)
+//       - active-ciphertext propagation (active cell's bytes were copied
+//         unchanged across transitions)
+//     Cost: ~150 ms per cell. A single S6 transition in LOCAL MODULAR adds
+//     ~25 seconds and the benchmark takes tens of minutes. Practical for
+//     REDUCED; for LOCAL MODULAR, use only when you specifically want the
+//     comparison number.
+#ifndef SECURITY_FULL_RERANDOMIZE
+#define SECURITY_FULL_RERANDOMIZE 0
+#endif
 
 // =============================================================================
 // Types
@@ -100,6 +166,11 @@ static mbedtls_mpi              g_priv, g_one;
 static mbedtls_mpi              g_neg_priv;             // N - priv, computed once
 static mbedtls_ctr_drbg_context g_drbg;
 static mbedtls_entropy_context  g_entropy;
+// Second DRBG context for the worker core — CTR-DRBG is not thread-safe, so
+// blinded scalar mul needs one DRBG per core to be callable from both cores
+// concurrently.
+static mbedtls_ctr_drbg_context g_drbg_core0;
+static mbedtls_entropy_context  g_entropy_core0;
 static Ciphertext               g_zero;                 // canonical Enc(0) literal
 static bool                     g_dual_core = false;
 static int                      g_step_decrypts = 0;
@@ -206,9 +277,10 @@ done:
 
 // Reference decrypt — used by self-test. The hot path uses row_decrypt below.
 static int elgamal_dec(const Ciphertext* ct, int* out) {
-    mbedtls_ecp_point c1, c2, ns, pm;
-    mbedtls_ecp_point_init(&ns);
-    mbedtls_ecp_point_init(&pm);
+    mbedtls_ecp_point c1, c2, pm;
+    mbedtls_ecp_point_init(&c1);          // init ALL points up-front so the
+    mbedtls_ecp_point_init(&c2);          // cleanup at `done:` is always safe
+    mbedtls_ecp_point_init(&pm);          // even on an early pt_decompress error
 
     int ret = pt_decompress(ct->c1, &c1); if (ret) goto done;
     ret     = pt_decompress(ct->c2, &c2); if (ret) goto done;
@@ -216,15 +288,21 @@ static int elgamal_dec(const Ciphertext* ct, int* out) {
     if (ret == 0) *out = mbedtls_ecp_is_zero(&pm) ? 0 : 1;
 
 done:
-    mbedtls_ecp_point_free(&c1); mbedtls_ecp_point_free(&c2);
-    mbedtls_ecp_point_free(&ns); mbedtls_ecp_point_free(&pm);
+    mbedtls_ecp_point_free(&c1);
+    mbedtls_ecp_point_free(&c2);
+    mbedtls_ecp_point_free(&pm);
     return ret;
 }
 
 // Homomorphic ciphertext addition — used by self-test.
 static int elgamal_add(const Ciphertext* a, const Ciphertext* b, Ciphertext* out) {
     mbedtls_ecp_point pa1, pa2, pb1, pb2, r1, r2;
-    mbedtls_ecp_point_init(&r1); mbedtls_ecp_point_init(&r2);
+    mbedtls_ecp_point_init(&pa1);         // init all six up-front so the
+    mbedtls_ecp_point_init(&pa2);         // cleanup goto is safe regardless
+    mbedtls_ecp_point_init(&pb1);         // of where pt_decompress fails
+    mbedtls_ecp_point_init(&pb2);
+    mbedtls_ecp_point_init(&r1);
+    mbedtls_ecp_point_init(&r2);
 
     int ret = pt_decompress(a->c1, &pa1); if (ret) goto done;
     ret     = pt_decompress(a->c2, &pa2); if (ret) goto done;
@@ -283,15 +361,25 @@ static int row_decrypt(const Supervisor& sv, const int8_t* row, int n,
         swap_pt(&s2, &tmp);
     }
 
-    // pm = (N-priv)*s1 + 1*s2   — single muladd: scalar mul + final add fused.
+    // Compute pm = (N-priv)*s1 + 1*s2 and check if it's the point at infinity.
+    // The scalar mul uses mbedtls_ecp_mul with a DRBG callback, which applies
+    // scalar blinding so the timing/power profile doesn't leak bits of priv.
+    // Each core uses its own DRBG (CTR-DRBG is not thread-safe).
     {
-        mbedtls_ecp_point pm;
+        mbedtls_ecp_point ns, pm;
+        mbedtls_ecp_point_init(&ns);
         mbedtls_ecp_point_init(&pm);
-        ret = mbedtls_ecp_muladd(&g_grp, &pm, &g_neg_priv, &s1, &g_one, &s2);
+        mbedtls_ctr_drbg_context* drbg =
+            (xPortGetCoreID() == CORE_WORKER) ? &g_drbg_core0 : &g_drbg;
+        ret = mbedtls_ecp_mul(&g_grp, &ns, &g_neg_priv, &s1,
+                              mbedtls_ctr_drbg_random, drbg);
+        if (ret == 0)
+            ret = mbedtls_ecp_muladd(&g_grp, &pm, &g_one, &s2, &g_one, &ns);
         if (ret == 0) {
             *out = mbedtls_ecp_is_zero(&pm) ? 0 : 1;
             *did_decrypt = true;
         }
+        mbedtls_ecp_point_free(&ns);
         mbedtls_ecp_point_free(&pm);
     }
 
@@ -301,6 +389,69 @@ done:
     mbedtls_ecp_point_free(&tmp);
     return ret;
 }
+
+#if SECURITY_FULL_RERANDOMIZE
+// Replace a cell with a fresh random ciphertext that decrypts to the same
+// plaintext. Two cases:
+//
+//   is_zero=true   : cell currently holds the literal g_zero. Generate a
+//                    fresh random Enc(0) via elgamal_enc(0) and populate the
+//                    decompressed cache by decompressing it.
+//   is_zero=false  : cell holds an unknown non-zero plaintext. Re-randomise
+//                    via additive homomorphism: pick random r, add (r·G,
+//                    r·Pub) homomorphically. The result decrypts identically
+//                    but has fresh bit pattern.
+//
+// Both paths cost ~150 ms (two scalar muls). Called once per cell per
+// transition when SECURITY_FULL_RERANDOMIZE is on.
+static int rerandomize_cell(Ciphertext* ct,
+                            mbedtls_ecp_point* c1_pt,
+                            mbedtls_ecp_point* c2_pt,
+                            bool is_zero,
+                            mbedtls_ctr_drbg_context* drbg) {
+    if (is_zero) {
+        int ret = elgamal_enc(0, ct, drbg);
+        if (ret) return ret;
+        // Cell was init'd-but-empty; free is a no-op then re-populate.
+        mbedtls_ecp_point_free(c1_pt);
+        mbedtls_ecp_point_free(c2_pt);
+        ret = pt_decompress(ct->c1, c1_pt); if (ret) return ret;
+        ret = pt_decompress(ct->c2, c2_pt);
+        return ret;
+    }
+
+    // Non-zero: re-randomise via (c1, c2) → (c1 + r·G, c2 + r·Pub).
+    mbedtls_mpi r;        mbedtls_mpi_init(&r);
+    mbedtls_ecp_point rG, rPub, new_c1, new_c2;
+    mbedtls_ecp_point_init(&rG);
+    mbedtls_ecp_point_init(&rPub);
+    mbedtls_ecp_point_init(&new_c1);
+    mbedtls_ecp_point_init(&new_c2);
+
+    int ret = mbedtls_ecp_gen_privkey(&g_grp, &r, mbedtls_ctr_drbg_random, drbg);
+    if (ret) goto done;
+    ret = mbedtls_ecp_mul(&g_grp, &rG,   &r, &g_G,   mbedtls_ctr_drbg_random, drbg);
+    if (ret) goto done;
+    ret = mbedtls_ecp_mul(&g_grp, &rPub, &r, &g_pub, mbedtls_ctr_drbg_random, drbg);
+    if (ret) goto done;
+
+    ret = pt_add(&new_c1, c1_pt, &rG);   if (ret) goto done;
+    ret = pt_add(&new_c2, c2_pt, &rPub); if (ret) goto done;
+
+    mbedtls_ecp_copy(c1_pt, &new_c1);
+    mbedtls_ecp_copy(c2_pt, &new_c2);
+    ret = pt_compress(c1_pt, ct->c1);
+    if (ret == 0) ret = pt_compress(c2_pt, ct->c2);
+
+done:
+    mbedtls_mpi_free(&r);
+    mbedtls_ecp_point_free(&rG);
+    mbedtls_ecp_point_free(&rPub);
+    mbedtls_ecp_point_free(&new_c1);
+    mbedtls_ecp_point_free(&new_c2);
+    return ret;
+}
+#endif  // SECURITY_FULL_RERANDOMIZE
 
 // Apply event ev_gi's transitions to sv. Updates both the compressed
 // ciphertext array and the persistent decompressed cache in lock-step.
@@ -327,6 +478,18 @@ static void do_transition(Supervisor& sv, int ev_gi, int n) {
         }
     }
 
+#if SECURITY_FULL_RERANDOMIZE
+    // Re-randomise every cell so no ciphertext shares bytes with another.
+    // Cells holding g_zero get a fresh Enc(0); non-zero cells are
+    // homomorphically blinded. ~150 ms per cell; yield every 16 cells so
+    // the main-core watchdog (5 s timeout) doesn't fire on big supervisors.
+    for (int i = 0; i < n; ++i) {
+        if (i > 0 && (i & 0xF) == 0) vTaskDelay(pdMS_TO_TICKS(1));
+        bool zero = is_g_zero(nxt[i]);
+        rerandomize_cell(&nxt[i], &nxt_c1[i], &nxt_c2[i], zero, &g_drbg);
+    }
+#endif
+
     sv_free_dec(sv);
     sv.enc    = std::move(nxt);
     sv.dec_c1 = std::move(nxt_c1);
@@ -337,14 +500,18 @@ static void do_transition(Supervisor& sv, int ev_gi, int n) {
 // Parallel decrypt engine
 // =============================================================================
 
-// Process work units [start, end). On the worker core we yield once per unit
-// so IDLE0 can feed the Task Watchdog.
+// Process work units [start, end). On the worker core we yield periodically
+// so IDLE0 can feed the Task Watchdog. Each iteration is ~70 ms and the WDT
+// timeout is 5 s, so yielding every 8 iterations leaves ample margin while
+// avoiding a wasted 1 ms tick on every decrypt.
+#define WORKER_YIELD_EVERY 8
 static void process_work_range(int start, int end,
                                 const std::vector<WorkUnit>& work,
                                 int* dec_count) {
-    bool worker_core = (xPortGetCoreID() == CORE_WORKER);
+    const bool worker_core = (xPortGetCoreID() == CORE_WORKER);
     for (int wi = start; wi < end; ++wi) {
-        if (worker_core) vTaskDelay(pdMS_TO_TICKS(1));
+        if (worker_core && (((wi - start) & (WORKER_YIELD_EVERY - 1)) == 0))
+            vTaskDelay(pdMS_TO_TICKS(1));
         const WorkUnit& w = work[wi];
         Supervisor& sv = g_sups[w.sv];
         int n  = (int)pgm_read_word(&sv.desc->num_states);
@@ -393,9 +560,18 @@ static void dispatch_parallel(const std::vector<WorkUnit>& work) {
 }
 
 // =============================================================================
-// Homomorphic step
+// Homomorphic step — the public per-event entry point
 // =============================================================================
-
+//
+// Given a fired event (by global event index), updates every supervisor's
+// encrypted state and produces the resulting enable bitmap.
+//
+//   en_out : output, sized to EVENT_COUNT. en_out[gi] = 0 iff some supervisor
+//            currently disables event gi.
+//   returns: 0 on success, mbedTLS error code otherwise.
+//
+// The step is internally split into three phases — see "ARCHITECTURE" at the
+// top of this file.
 static int he_step(int ev_gi, std::vector<int>& en_out) {
     en_out.assign(EVENT_COUNT, 1);
 
@@ -428,6 +604,17 @@ static int he_step(int ev_gi, std::vector<int>& en_out) {
 // =============================================================================
 // Supervisor loading and invariance precomputation
 // =============================================================================
+//
+// One-time setup per benchmark. Reads the SupDesc descriptors from PROGMEM,
+// populates the runtime Supervisor structs, and precomputes the conditional-
+// invariance lists used by he_step to skip rows whose values can't possibly
+// have changed.
+//
+// The conditional-invariance precomputation is the densest piece of code in
+// this file. It answers, for every (supervisor, event, row) triple, the
+// question: "if this supervisor receives this event, can this row's
+// homomorphic OR-sum flip 0→1 or 1→0?"  See comments inside the inner loops
+// for the precise condition.
 
 static bool load_supervisors(const SupDesc* descs, int count) {
     g_sups.clear();
@@ -761,6 +948,14 @@ static void crypto_init() {
                              mbedtls_ctr_drbg_random, &g_drbg);
     mbedtls_mpi_sub_mpi(&g_neg_priv, &g_grp.N, &g_priv);   // fixed for the run
     elgamal_enc(0, &g_zero, &g_drbg);
+
+    // Seed the worker core's DRBG with a different personalisation string so
+    // the two cores' RNG streams are independent.
+    mbedtls_ctr_drbg_init(&g_drbg_core0);
+    mbedtls_entropy_init(&g_entropy_core0);
+    const char* pers_c0 = "esp32_he_core0";
+    mbedtls_ctr_drbg_seed(&g_drbg_core0, mbedtls_entropy_func, &g_entropy_core0,
+                           (const uint8_t*)pers_c0, strlen(pers_c0));
 }
 
 // One-time measurement of mbedtls scalar mul / muladd cost for the build banner.
@@ -810,7 +1005,11 @@ void setup() {
     Serial.println("============================================");
     Serial.printf("  EVENT_COUNT : %d\n",      EVENT_COUNT);
     Serial.printf("  SIM_SEQ_LEN : %d\n",      SIM_SEQ_LEN);
-    Serial.printf("  Ciphertext  : %u bytes\n\n", (unsigned)sizeof(Ciphertext));
+    Serial.printf("  Ciphertext  : %u bytes\n", (unsigned)sizeof(Ciphertext));
+    Serial.printf("  Security    : %s\n\n",
+                  SECURITY_FULL_RERANDOMIZE
+                      ? "scalar blinding + cell re-randomisation"
+                      : "scalar blinding (default)");
 
     crypto_init();
 

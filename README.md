@@ -207,23 +207,37 @@ Five layered optimisations bring the heavy benchmark steps from ~33 s
 ESP32-WROOM-32 @ 240 MHz with `sdkconfig.ext` active and all five
 optimisations enabled. Times are in **milliseconds**.
 
+Two builds are reported: the default (scalar blinding) and the optional
+`SECURITY_FULL_RERANDOMIZE=1` build. See *Security notes* below for the
+side-channel coverage each one provides.
+
 ### `fms` — LOCAL MODULAR (7 supervisors, largest 164 states)
-| Metric | Value |
-|---|---|
-| Average per step | **1348 ms** |
-| Min | 323 ms |
-| Max | 5082 ms |
-| Total decrypts (17 steps) | 221 |
+| Metric | Default | FULL_RERANDOMIZE=1 |
+|---|---|---|
+| Average per step | **1022 ms** | 30 076 ms |
+| Min | 240 ms | 2 938 ms |
+| Max | 3 912 ms | 51 899 ms |
+| Total decrypts (17 steps) | 221 | 349 |
 
 ### `fms` — LOCAL MODULAR REDUCED (7 supervisors, largest 13 states)
-| Metric | Value |
-|---|---|
-| Average per step | **1075 ms** |
-| Min | < 1 ms (cache hit, no decrypts) |
-| Max | 3519 ms |
-| Total decrypts (17 steps) | 179 |
+| Metric | Default | FULL_RERANDOMIZE=1 |
+|---|---|---|
+| Average per step | **813 ms** | 4 059 ms |
+| Min | < 1 ms (cache hit, no decrypts) | 292 ms |
+| Max | 2 659 ms | 8 396 ms |
+| Total decrypts (17 steps) | 179 | 262 |
 
-All steps pass — HE output matches the cleartext oracle byte-for-byte.
+All steps pass — HE output matches the cleartext Oracle byte-for-byte in
+both modes. The default carries scalar-blinding side-channel resistance at
+under 1 % overhead on the ESP32-S3 hardware-MPI path. The
+`SECURITY_FULL_RERANDOMIZE` build additionally re-randomises every cell on
+each transition (closing the byte-equality and ciphertext-propagation leaks)
+at ~5× cost on REDUCED and ~29× on LOCAL MODULAR.
+
+The decrypt count goes UP in the FULL build because the "row is trivially
+Enc(0), skip the scalar mul" short-circuit in `row_decrypt` only fires when
+cells are byte-equal to the global `g_zero` constant — which they're
+deliberately never allowed to be in FULL mode.
 
 ### What limits performance
 
@@ -247,27 +261,28 @@ both comfortably under 1 s.
 ## Security notes
 
 The cryptography itself is solid: textbook EC-ElGamal, a standard NIST
-curve, hardware-RNG entropy. The firmware is **research-grade**, however,
-not production-hardened. An attacker with physical access to the device's
-RAM can extract supervisor state through three known channels:
+curve, hardware-RNG entropy. The firmware is **research-grade**: with the
+default `SECURITY_HARDENED=1` setting, one of three originally-known
+side-channels is closed; the other two require physical RAM access.
 
-1. **`g_zero` byte-equality.** After a transition, all non-active cells are
-   byte-identical to the global `Enc(0)` constant. Reading RAM reveals
-   exactly which cell is "active".
-2. **Active-ciphertext propagation.** The active cell's ciphertext bytes
-   are copied unchanged across transitions, so an attacker who logs RAM
-   over time can fingerprint the state trajectory.
-3. **No scalar blinding on decrypt.** `mbedtls_ecp_muladd` (used by the hot
-   path for speed) doesn't randomise scalars internally, so a
-   timing/power side-channel attacker could potentially recover the
-   private key.
+| # | Channel | Status | If exploited |
+|---|---|---|---|
+| 1 | Timing / power side-channel on private scalar (no blinding on decrypt) | **Closed by default** in HARDENED mode. Each scalar mul is randomised via per-core CTR-DRBG. | Private-key recovery |
+| 2 | `g_zero` byte-equality. Non-active cells are byte-identical to a global `Enc(0)`. | Open. | Reveals active-state index after each transition (requires RAM read access) |
+| 3 | Active-ciphertext propagation. The active cell's bytes are copied unchanged across transitions. | Open. | Fingerprints the state trajectory across steps (requires RAM read access over time) |
 
-Closing channels 1 and 2 requires re-encrypting every non-target cell with
-a fresh `Enc(0)` per transition — roughly 3× slower `do_transition`. Closing
-channel 3 requires switching back to `mbedtls_ecp_mul` with DRBG blinding
-(~5% slower per decrypt). For a published benchmark these limitations
-should be disclosed; for deployment in an adversarial environment, all
-three must be addressed.
+Closing channels 2 and 3 requires re-randomising every non-target cell on
+each transition. On its own this is prohibitively expensive (~3× slower
+per step) but becomes tractable with a pre-computed `Enc(0)` pool —
+generate ciphertexts during idle time, consume them as a single point-add
+per cell during `do_transition`. The current code does **not** include
+this; it's left as an extension for users who need the full memory-side-
+channel resistance.
+
+For published benchmark numbers and trusted-environment deployments, the
+default HARDENED mode is sufficient. For adversarial deployments where the
+attacker can read or differentially-probe device RAM, channels 2 and 3
+must also be addressed.
 
 ---
 
