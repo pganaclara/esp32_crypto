@@ -4,22 +4,3 @@ secrets.h
 
 # Local Claude Code settings (per-machine permissions).
 .claude/settings.local.json
-
-# LaTeX build output — regenerated on every compile.
-thesis/errlog/
-*.aux
-*.log
-*.toc
-*.lof
-*.lot
-*.idx
-*.ind
-*.ilg
-*.bbl
-*.blg
-*.out
-*.synctex.gz
-*.fls
-*.fdb_latexmk
-*.chktex
-*.pdf.opt

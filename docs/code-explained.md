@@ -2,7 +2,7 @@
 
 A walkthrough of every layer of this project, with the reasoning behind each
 design decision and the literature it rests on. Written to be usable as raw
-material for a thesis or paper chapter.
+material for a paper.
 
 Citations are keyed `[n]` to the [References](#references) at the end. Everything
 cited there was checked against an accessible source; the two entries whose
