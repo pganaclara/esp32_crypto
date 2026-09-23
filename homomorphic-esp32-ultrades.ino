@@ -12,15 +12,15 @@
 // The state distribution itself is never decrypted on the normal run path.
 //
 // ── HOW TO RUN ───────────────────────────────────────────────────────────────
-//   1. Drop  supervisor_data_<PROBLEM>.h  AND  sdkconfig.ext  into this folder
+//   1. Drop  supervisor_data_<PROBLEM>.h  into this folder
 //   2. Update the #include below to match your .h file
 //   3. Flash, open Serial Monitor at 115200 baud
 //
-//   sdkconfig.ext is essential — it enables hardware MPI acceleration. Without
-//   it the firmware still works but is roughly 5× slower.
+//   No sdkconfig file is needed: the Arduino core's precompiled mbedTLS already
+//   has hardware MPI and NIST fast reduction enabled.
 //
 // ── HOW TO USE WITH A NEW DES PROBLEM ────────────────────────────────────────
-//   The companion notebook (generator_ultrades_mono_lmod_lmodred.ipynb) holds
+//   The companion notebook (notebook/generator_ultrades.ipynb) holds
 //   the plant and specification definitions. Pick a PROBLEM in Cell 3, define
 //   plants/specs in Cell 4 (copy one of the existing problems as a template),
 //   run the notebook, then copy the generated .h next to this sketch.
@@ -31,11 +31,10 @@
 //   a per-core DRBG callback, closing the timing/power side-channel on the
 //   private key. Measured cost is below 1 % on the ESP32-S3 hardware-MPI path.
 //
-//   One optional flag, SECURITY_FULL_RERANDOMIZE, additionally re-randomises
-//   every cell after each transition (closes the g_zero byte-equality and
-//   active-ciphertext-propagation memory-side-channel leaks). It's very
-//   expensive (~150 ms per cell) — see the comment at the flag's definition
-//   for details. Default OFF; turn it on only for comparison/research.
+//   Two memory side-channels remain open by design: inactive cells are
+//   byte-identical to the global Enc(0) constant, and the active cell's bytes
+//   are copied unchanged across transitions. Both need RAM read access. See
+//   the security section of README.md.
 //
 // Tested with Arduino ESP32 core v3.x on ESP32-WROOM-32 and ESP32-S3.
 // =============================================================================
@@ -55,18 +54,21 @@
 //   PHASE 2 (both cores, parallel) — decrypt the work units
 //     dispatch_parallel splits the work list in half. The main core handles
 //     the first half; a persistent worker task on core 0 (woken by semaphore)
-//     handles the other. Both call row_decrypt().
+//     handles the other. Both call row_decrypt(). The list holds one entry per
+//     DISTINCT row sum, not per row — see optimisation 6.
 //
 //   PHASE 3 (main core, serial) — emit en_out
 //     Walk every supervisor's cached_en[] and produce the global enable bitmap.
 //
-// Five optimisations stack to bring this from ~33 s/step (naive) to ~1 s/step:
+// Six optimisations stack to bring this down from the naive ~33 s/step:
 //
 //   1. Conditional invariance  — only re-decrypt rows that can actually flip
 //   2. Persistent decompressed cache — never run pt_decompress in the hot path
 //   3. Skip Enc(0) summands    — most cells are the literal g_zero constant
 //   4. Fused row-sum + decrypt — single mbedtls_ecp_muladd does both
 //   5. Dual-core work-unit split — phase 2 splits cleanly across both cores
+//   6. Share identical row sums — rows covering the same non-zero cells have
+//      the same sum, so they are decrypted once and the result fanned out
 // =============================================================================
 
 #include <Arduino.h>
@@ -82,7 +84,7 @@
 #include <freertos/semphr.h>
 #include <vector>
 
-#include "supervisor_data_fms.h"
+#include "supervisor_data_extended_small_factory.h"
 
 // =============================================================================
 // Configuration
@@ -106,22 +108,6 @@
 // Attacks Are Still Practical"). Each core has its own DRBG context because
 // mbedTLS CTR-DRBG is not thread-safe. Measured overhead vs. unblinded fused
 // muladd: < 1 % — effectively free on the ESP32 hardware-MPI path.
-//
-// SECURITY_FULL_RERANDOMIZE (default OFF, EXPENSIVE — research comparison only)
-//     After every do_transition, replace every cell with a fresh random
-//     ciphertext that decrypts to the same plaintext. Closes the remaining
-//     two RAM/side-channel leaks:
-//       - g_zero byte-equality (non-active cells were byte-identical to the
-//         global Enc(0) constant)
-//       - active-ciphertext propagation (active cell's bytes were copied
-//         unchanged across transitions)
-//     Cost: ~150 ms per cell. A single S6 transition in LOCAL MODULAR adds
-//     ~25 seconds and the benchmark takes tens of minutes. Practical for
-//     REDUCED; for LOCAL MODULAR, use only when you specifically want the
-//     comparison number.
-#ifndef SECURITY_FULL_RERANDOMIZE
-#define SECURITY_FULL_RERANDOMIZE 0
-#endif
 
 // =============================================================================
 // Types
@@ -147,12 +133,17 @@ struct Supervisor {
     std::vector<std::vector<uint8_t>> changes_if_one;
 };
 
-// One (supervisor, constrained-row) decrypt task.
-struct WorkUnit { uint8_t sv; uint8_t li; };
+// One decrypt task. `li` is a REPRESENTATIVE constrained row: every row of the
+// same supervisor whose homomorphic sum has identical summands shares this unit
+// and reuses `out` (see optimisation 6 in he_step).
+struct WorkUnit { uint8_t sv; uint8_t li; int8_t out; };
+
+// Maps one enqueued row back to the unit whose result it takes.
+struct RowRef { uint8_t sv; uint8_t li; uint16_t unit; };
 
 struct WorkerCmd {
     int start, end;
-    const std::vector<WorkUnit>* work;
+    std::vector<WorkUnit>* work;
 };
 
 // =============================================================================
@@ -390,69 +381,6 @@ done:
     return ret;
 }
 
-#if SECURITY_FULL_RERANDOMIZE
-// Replace a cell with a fresh random ciphertext that decrypts to the same
-// plaintext. Two cases:
-//
-//   is_zero=true   : cell currently holds the literal g_zero. Generate a
-//                    fresh random Enc(0) via elgamal_enc(0) and populate the
-//                    decompressed cache by decompressing it.
-//   is_zero=false  : cell holds an unknown non-zero plaintext. Re-randomise
-//                    via additive homomorphism: pick random r, add (r·G,
-//                    r·Pub) homomorphically. The result decrypts identically
-//                    but has fresh bit pattern.
-//
-// Both paths cost ~150 ms (two scalar muls). Called once per cell per
-// transition when SECURITY_FULL_RERANDOMIZE is on.
-static int rerandomize_cell(Ciphertext* ct,
-                            mbedtls_ecp_point* c1_pt,
-                            mbedtls_ecp_point* c2_pt,
-                            bool is_zero,
-                            mbedtls_ctr_drbg_context* drbg) {
-    if (is_zero) {
-        int ret = elgamal_enc(0, ct, drbg);
-        if (ret) return ret;
-        // Cell was init'd-but-empty; free is a no-op then re-populate.
-        mbedtls_ecp_point_free(c1_pt);
-        mbedtls_ecp_point_free(c2_pt);
-        ret = pt_decompress(ct->c1, c1_pt); if (ret) return ret;
-        ret = pt_decompress(ct->c2, c2_pt);
-        return ret;
-    }
-
-    // Non-zero: re-randomise via (c1, c2) → (c1 + r·G, c2 + r·Pub).
-    mbedtls_mpi r;        mbedtls_mpi_init(&r);
-    mbedtls_ecp_point rG, rPub, new_c1, new_c2;
-    mbedtls_ecp_point_init(&rG);
-    mbedtls_ecp_point_init(&rPub);
-    mbedtls_ecp_point_init(&new_c1);
-    mbedtls_ecp_point_init(&new_c2);
-
-    int ret = mbedtls_ecp_gen_privkey(&g_grp, &r, mbedtls_ctr_drbg_random, drbg);
-    if (ret) goto done;
-    ret = mbedtls_ecp_mul(&g_grp, &rG,   &r, &g_G,   mbedtls_ctr_drbg_random, drbg);
-    if (ret) goto done;
-    ret = mbedtls_ecp_mul(&g_grp, &rPub, &r, &g_pub, mbedtls_ctr_drbg_random, drbg);
-    if (ret) goto done;
-
-    ret = pt_add(&new_c1, c1_pt, &rG);   if (ret) goto done;
-    ret = pt_add(&new_c2, c2_pt, &rPub); if (ret) goto done;
-
-    mbedtls_ecp_copy(c1_pt, &new_c1);
-    mbedtls_ecp_copy(c2_pt, &new_c2);
-    ret = pt_compress(c1_pt, ct->c1);
-    if (ret == 0) ret = pt_compress(c2_pt, ct->c2);
-
-done:
-    mbedtls_mpi_free(&r);
-    mbedtls_ecp_point_free(&rG);
-    mbedtls_ecp_point_free(&rPub);
-    mbedtls_ecp_point_free(&new_c1);
-    mbedtls_ecp_point_free(&new_c2);
-    return ret;
-}
-#endif  // SECURITY_FULL_RERANDOMIZE
-
 // Apply event ev_gi's transitions to sv. Updates both the compressed
 // ciphertext array and the persistent decompressed cache in lock-step.
 static void do_transition(Supervisor& sv, int ev_gi, int n) {
@@ -466,29 +394,45 @@ static void do_transition(Supervisor& sv, int ev_gi, int n) {
         mbedtls_ecp_point_init(&nxt_c2[i]);
     }
 
+    // The image of a state set under an event is a UNION, not an assignment.
+    // Two source states may converge on the same target — supervisor_data_fms.h
+    // has 11 such collisions in its reduced supervisors — and writing
+    // `nxt[to] = enc[from]` unconditionally lets whichever pair the generator
+    // emitted last win, so an INACTIVE source silently overwrites an ACTIVE one.
+    // The result then depends on the order the pairs happen to sit in the .h,
+    // which is not stable across regenerations (supervisor reduction relabels
+    // states freely).
+    //
+    // Skipping zero sources makes the common path correct at no cost: a cell
+    // holding the literal Enc(0) contributes nothing to a union, so it can never
+    // clobber an active cell. If two ACTIVE sources ever converge — impossible
+    // for a one-hot state vector, but not worth assuming — they are combined
+    // with the additive homomorphism, which is the same OR used everywhere else.
     for (uint16_t p = 0; p < pc; ++p) {
         int from = pm_i16(sv.desc->trans + off * 2, p * 2);
         int to   = pm_i16(sv.desc->trans + off * 2, p * 2 + 1);
-        nxt[to]  = sv.enc[from];
-        if (!is_g_zero(sv.enc[from])) {
+        if (is_g_zero(sv.enc[from])) continue;          // contributes nothing
+        if (is_g_zero(nxt[to])) {
+            nxt[to] = sv.enc[from];
             // Deep-copy the already-decompressed point — far cheaper than
             // re-running pt_decompress on the target cell.
             mbedtls_ecp_copy(&nxt_c1[to], &sv.dec_c1[from]);
             mbedtls_ecp_copy(&nxt_c2[to], &sv.dec_c2[from]);
+        } else {
+            mbedtls_ecp_point s1, s2;
+            mbedtls_ecp_point_init(&s1);
+            mbedtls_ecp_point_init(&s2);
+            if (pt_add(&s1, &nxt_c1[to], &sv.dec_c1[from]) == 0 &&
+                pt_add(&s2, &nxt_c2[to], &sv.dec_c2[from]) == 0) {
+                mbedtls_ecp_copy(&nxt_c1[to], &s1);
+                mbedtls_ecp_copy(&nxt_c2[to], &s2);
+                pt_compress(&nxt_c1[to], nxt[to].c1);
+                pt_compress(&nxt_c2[to], nxt[to].c2);
+            }
+            mbedtls_ecp_point_free(&s1);
+            mbedtls_ecp_point_free(&s2);
         }
     }
-
-#if SECURITY_FULL_RERANDOMIZE
-    // Re-randomise every cell so no ciphertext shares bytes with another.
-    // Cells holding g_zero get a fresh Enc(0); non-zero cells are
-    // homomorphically blinded. ~150 ms per cell; yield every 16 cells so
-    // the main-core watchdog (5 s timeout) doesn't fire on big supervisors.
-    for (int i = 0; i < n; ++i) {
-        if (i > 0 && (i & 0xF) == 0) vTaskDelay(pdMS_TO_TICKS(1));
-        bool zero = is_g_zero(nxt[i]);
-        rerandomize_cell(&nxt[i], &nxt_c1[i], &nxt_c2[i], zero, &g_drbg);
-    }
-#endif
 
     sv_free_dec(sv);
     sv.enc    = std::move(nxt);
@@ -506,13 +450,13 @@ static void do_transition(Supervisor& sv, int ev_gi, int n) {
 // avoiding a wasted 1 ms tick on every decrypt.
 #define WORKER_YIELD_EVERY 8
 static void process_work_range(int start, int end,
-                                const std::vector<WorkUnit>& work,
+                                std::vector<WorkUnit>& work,
                                 int* dec_count) {
     const bool worker_core = (xPortGetCoreID() == CORE_WORKER);
     for (int wi = start; wi < end; ++wi) {
         if (worker_core && (((wi - start) & (WORKER_YIELD_EVERY - 1)) == 0))
             vTaskDelay(pdMS_TO_TICKS(1));
-        const WorkUnit& w = work[wi];
+        WorkUnit& w = work[wi];
         Supervisor& sv = g_sups[w.sv];
         int n  = (int)pgm_read_word(&sv.desc->num_states);
         int gi = sv.constrained_gi[w.li];
@@ -520,7 +464,9 @@ static void process_work_range(int start, int end,
         int e; bool did_decrypt;
         if (row_decrypt(sv, sv.desc->enable + gi * n, n, &e, &did_decrypt) != 0) continue;
         if (did_decrypt) (*dec_count)++;
-        sv.cached_en[w.li] = (int8_t)e;
+        // Result goes to the unit, not straight to a row: he_step fans it out
+        // to every row that shares these summands.
+        w.out = (int8_t)e;
     }
 }
 
@@ -537,7 +483,7 @@ static void persistent_worker_task(void*) {
 }
 
 // Split work in half between the two cores, then join.
-static void dispatch_parallel(const std::vector<WorkUnit>& work) {
+static void dispatch_parallel(std::vector<WorkUnit>& work) {
     if (work.empty()) return;
 
     if (g_dual_core) {
@@ -577,21 +523,71 @@ static int he_step(int ev_gi, std::vector<int>& en_out) {
 
     // Phase 1 (main core, serial): apply transitions, build work list. A row
     // is enqueued only if its current cached value could actually flip.
+    //
+    // OPTIMISATION 6 — share identical row sums.
+    // row_decrypt sums the cells of a row that are not the literal g_zero, so a
+    // row's homomorphic sum is determined entirely by which NON-ZERO cells it
+    // covers — not by the row itself. Once the non-zero set has contracted to
+    // the active cell (which it does within a few steps), EVERY row that covers
+    // that cell has the SAME sum, and the old code ran the same 69 ms scalar
+    // multiplication once per row. Rows are therefore grouped here by their
+    // summand set; each distinct set is decrypted once and the result fanned
+    // out. Nothing new is revealed: this reuses a value the code already
+    // computes, via the same is_g_zero test it already performs.
     static std::vector<WorkUnit> work;
+    static std::vector<RowRef>   refs;
+    static std::vector<uint16_t> nz;        // cells that are not the g_zero literal
+    static std::vector<uint8_t>  queued;    // rows enqueued for the current sv
     work.clear();
+    refs.clear();
+
     for (size_t i = 0; i < g_sups.size(); ++i) {
         Supervisor& sv = g_sups[i];
         if (!(sv.trans_event_mask & (1u << ev_gi))) continue;     // cached values still valid
         int n = (int)pgm_read_word(&sv.desc->num_states);
         do_transition(sv, ev_gi, n);
+
+        queued.clear();
         for (uint8_t li : sv.changes_if_zero[ev_gi])
-            if (sv.cached_en[li] == 0) work.push_back({(uint8_t)i, li});
+            if (sv.cached_en[li] == 0) queued.push_back(li);
         for (uint8_t li : sv.changes_if_one[ev_gi])
-            if (sv.cached_en[li] == 1) work.push_back({(uint8_t)i, li});
+            if (sv.cached_en[li] == 1) queued.push_back(li);
+        if (queued.empty()) continue;
+
+        nz.clear();
+        for (int s = 0; s < n; ++s)
+            if (!is_g_zero(sv.enc[s])) nz.push_back((uint16_t)s);
+
+        const size_t base = work.size();          // units belonging to this sv
+        for (uint8_t li : queued) {
+            const int8_t* row = sv.desc->enable + sv.constrained_gi[li] * n;
+
+            int unit = -1;
+            for (size_t k = base; k < work.size(); ++k) {
+                const int8_t* other =
+                    sv.desc->enable + sv.constrained_gi[work[k].li] * n;
+                bool same = true;
+                for (uint16_t idx : nz)
+                    if ((pm_i8(row, idx) != 0) != (pm_i8(other, idx) != 0)) { same = false; break; }
+                if (same) { unit = (int)k; break; }
+            }
+            if (unit < 0) {
+                work.push_back({(uint8_t)i, li, -1});
+                unit = (int)work.size() - 1;
+            }
+            refs.push_back({(uint8_t)i, li, (uint16_t)unit});
+        }
     }
 
-    // Phase 2: parallel decrypt across both cores.
+    // Phase 2: parallel decrypt across both cores — one pass per DISTINCT sum.
     dispatch_parallel(work);
+
+    // Phase 2b: fan each unit's result out to every row that shares it. A unit
+    // left at -1 means row_decrypt failed; that row keeps its cached value.
+    for (const RowRef& r : refs) {
+        int8_t out = work[r.unit].out;
+        if (out >= 0) g_sups[r.sv].cached_en[r.li] = out;
+    }
 
     // Phase 3: emit en_out from cached_en.
     for (auto& sv : g_sups)
@@ -745,12 +741,17 @@ static bool init_states() {
 }
 
 // Compute initial cached_en for every (sv, row) by running the parallel engine.
+// No sharing is possible here: before the first transition every cell is a
+// fresh encryption, so no cell equals the g_zero literal and every row has a
+// distinct summand set. One unit per row.
 static void warm_cache() {
     std::vector<WorkUnit> work;
     for (size_t i = 0; i < g_sups.size(); ++i)
         for (size_t li = 0; li < g_sups[i].constrained_gi.size(); ++li)
-            work.push_back({(uint8_t)i, (uint8_t)li});
+            work.push_back({(uint8_t)i, (uint8_t)li, -1});
     dispatch_parallel(work);
+    for (const WorkUnit& w : work)
+        if (w.out >= 0) g_sups[w.sv].cached_en[w.li] = w.out;
 }
 
 // =============================================================================
@@ -779,10 +780,14 @@ struct Oracle {
             if (pc > 0) {
                 int off = trans_offset(&descs[i], ev_gi);
                 std::vector<int> nxt(n, 0);
+                // Union, not assignment — see the note in do_transition(). The
+                // oracle MUST make the same correction: if it kept the bug it
+                // would agree with a buggy homomorphic path, the comparison
+                // below would pass, and the benchmark would certify nothing.
                 for (uint16_t p = 0; p < pc; ++p) {
                     int from = pm_i16(descs[i].trans, (off + p) * 2);
                     int to   = pm_i16(descs[i].trans, (off + p) * 2 + 1);
-                    nxt[to]  = st[i][from];
+                    nxt[to] |= st[i][from];
                 }
                 st[i] = nxt;
             }
@@ -1006,10 +1011,7 @@ void setup() {
     Serial.printf("  EVENT_COUNT : %d\n",      EVENT_COUNT);
     Serial.printf("  SIM_SEQ_LEN : %d\n",      SIM_SEQ_LEN);
     Serial.printf("  Ciphertext  : %u bytes\n", (unsigned)sizeof(Ciphertext));
-    Serial.printf("  Security    : %s\n\n",
-                  SECURITY_FULL_RERANDOMIZE
-                      ? "scalar blinding + cell re-randomisation"
-                      : "scalar blinding (default)");
+    Serial.printf("  Security    : scalar blinding\n\n");
 
     crypto_init();
 
