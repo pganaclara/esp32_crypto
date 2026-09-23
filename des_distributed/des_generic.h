@@ -237,9 +237,6 @@ static void des_sleep_ms(uint32_t ms) {
 #include DES_DATA_HEADER
 #include "des_transport.h"
 
-// Lets the MQTT binding reuse our clock without depending on this header.
-static uint32_t des_millis_fwd() { return des_millis(); }
-
 // =============================================================================
 // 3. Family selection — resolves to a descriptor array + count
 // =============================================================================
@@ -469,8 +466,8 @@ static bool        g_safe_halt = false;
 static const char* g_halt_why  = nullptr;
 
 // Participant lock (held between VOTE-YES and COMMIT/ABORT).
-static uint8_t  g_lock_by = 0, g_lock_ev = 0xFF;
-static uint32_t g_lock_seq = 0, g_lock_t0 = 0;
+static uint8_t  g_lock_by = 0;
+static uint32_t g_lock_t0 = 0;
 
 // The initiator's side of the same discipline. While this node is collecting
 // votes for its own transaction (phase 1) or committing it (phase 2), its state
@@ -1453,8 +1450,7 @@ static void dispatch(const DesFrame& f) {
                 } else { tx(M_VOTE, f.ev, f.seq, 0); break; }       // busy -> no
             }
             bool ok = local_enabled(f.ev);
-            if (ok) { g_lock_by = f.src; g_lock_ev = f.ev; g_lock_seq = f.seq;
-                      g_lock_t0 = des_millis(); }
+            if (ok) { g_lock_by = f.src; g_lock_t0 = des_millis(); }
             tx(M_VOTE, f.ev, f.seq, ok ? 1 : 0);
             DES_REACT_TAG();
             DES_LOG("vote   %-4s  %-3s to node %d          (seq %u)\n",

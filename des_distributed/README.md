@@ -10,7 +10,7 @@ the owner election, the shared/local partition and the participant sets are all
 
 ```
 des_generic.h      the engine    — no Arduino, no FreeRTOS, no ESP-IDF
-des_transport.h    the bindings  — UDP multicast · MQTT · loopback
+des_transport.h    the transport — UDP/IP multicast
 des_distributed.ino  ESP32 entry point   (config + setup/loop)
 host_main.cpp        POSIX entry point   (Linux / *BSD / macOS)
 secrets.example.h    template for secrets.h — Wi-Fi + cell key (secrets.h is not versioned)
@@ -35,12 +35,13 @@ coordination layer on it cannot claim a path to industrial deployment. It has
 been removed.
 
 MQTT is genuinely open (OASIS, **ISO/IEC 20922**) with open-source brokers and
-clients, and it is provided here as a binding. It is not the default, for three
-reasons: a broker is a third failure domain between two controllers a metre
-apart; a well-tuned industrial ESP32/MQTT path still measures 3 ms min /
-12 ms avg / **72 ms max** round-trip, and the jitter is what hurts an interlock;
-and the broker sees every frame, which sits awkwardly with a design whose whole
-point is that the plant state stays encrypted.
+clients. It was not chosen, for three reasons: a broker is a third failure
+domain between two controllers a metre apart; a well-tuned industrial
+ESP32/MQTT path still measures 3 ms min / 12 ms avg / **72 ms max** round-trip,
+and the jitter is what hurts an interlock; and the broker sees every frame,
+which sits awkwardly with a design whose whole point is that the plant state
+stays encrypted. (An MQTT binding was written and later removed: it was never
+measured against a live broker, and untested code is no evidence.)
 
 ### The default: UDP/IP multicast
 
@@ -69,8 +70,9 @@ struct DesTransport {
 That is the entire contract. A transport only has to be **best effort**, because
 sequencing, acknowledgement, retransmission and atomicity are supplied by the
 protocol itself — the classic **end-to-end argument** (Saltzer, Reed & Clark
-1984). That is also why the MQTT binding publishes at QoS 0 by default: broker
-QoS would redo, per frame, work the 2PC already guarantees end to end.
+1984). It is also why a transport's own per-hop reliability, such as MQTT's QoS
+1/2, would add nothing: it would redo, per frame, work the 2PC already
+guarantees end to end.
 
 | | UDP multicast | MQTT | OPC UA PubSub | DDS | (ESP-NOW) |
 |---|---|---|---|---|---|
@@ -78,7 +80,7 @@ QoS would redo, per frame, work the 2PC already guarantees end to end.
 | open-source stack | none needed | Mosquitto/EMQX | open62541 (MPL-2.0) | Cyclone (EPL-2.0), Fast DDS (Apache-2.0) | Espressif only |
 | broker | no | **yes** | no | no | no |
 | runs off-ESP32 | **yes** | yes | yes | yes | **no** |
-| status here | **default** | provided | ~100 lines to add | ~80 lines to add | removed |
+| status here | **implemented** | not chosen | ~100 lines to add | ~80 lines to add | removed |
 
 Adding OPC UA PubSub or DDS means implementing those four functions. Neither is
 bundled only because each pulls in a build system this sketch does not assume.
@@ -284,7 +286,6 @@ editing.
 | `DES_FAMILY` | `LMOD_RED` | `LMOD_RED`, `LMOD`, or `MONO` (centralised baseline) |
 | `DES_SUP_NODE_MAP` | *(even block partition)* | explicit supervisor→node, e.g. `{1,1,1,2,2,3,3}` |
 | `DES_CONTROLLABLE_MASK` | *(inferred)* | override the controllability inference |
-| `DES_TRANSPORT` | `UDP` | `UDP`, `MQTT`, `LOOPBACK` |
 | `DES_BENCH_LOCKSTEP` | `0` | 0 = each node walks freely, waiting only on SHARED events (recommended); 1 = every node replays the whole trace — reproducible, but needs the nodes to keep step |
 | `DES_SIMULATE_LOSS_PCT` | `0` | inject loss: `30` exercises retransmission, `90` forces a SAFE HALT |
 | `DES_RXQ_LEN` | `64` | receive queue depth, power of two — see §4a |
@@ -469,8 +470,7 @@ derived routing gives **16 of 31 events traffic-free**. Override with
    Module**, Serial **115200**.
 2. Copy `secrets.example.h` to `secrets.h` and fill it in. It holds the
    credentials, and is listed in `.gitignore` so they never reach a repository:
-   * `WIFI_SSID` / `WIFI_PASS` — the IP transports need an access point. (For a
-     single-board bring-up with no network, use `DES_TRANSPORT_LOOPBACK`.)
+   * `WIFI_SSID` / `WIFI_PASS` — the access point every node joins.
    * `DES_AUTH_KEY`, the cell's shared secret: **identical on every node**, at
      least 32 characters, random (`python -c "import secrets;
      print(secrets.token_hex(32))"`). The build refuses to start without one, or
@@ -511,7 +511,7 @@ to keep the traffic on that machine).
 
 * **ESP32 build.** Compiles with `-Wall -Wextra` and zero warnings against ESP32
   Arduino core 3.3.12 (`xtensa-esp32s3-elf-g++`), across all three problems ×
-  2 and 3 nodes × all three families × UDP and MQTT × lockstep on and off.
+  2 and 3 nodes × all three families × lockstep on and off.
 * **Two ESP32-S3 boards, fms, 5 cycles.** All 220 steps, 0 skipped, 0
   retransmissions, oracle PASS on both, no halt. Decryptions **100 + 397**,
   equal step by step (240 of 240) to the model's prediction made before the
@@ -566,8 +566,8 @@ to keep the traffic on that machine).
   | a whole run recorded, then replayed verbatim ×5 (615 frames) into a new run | new run complete, 44/44, no halt, no false "restarted" or "duplicate id"; 20 challenges |
   | every live frame resent with one bit flipped, plus HALTs with random tags — 1.8 M frames in 10 s | all rejected; run complete, 0 skips |
 
-* **Not exercised:** the MQTT binding against a live broker, and more than two
-  physical boards. The flood above was absorbed by a PC. An ESP32 spends
+* **Not exercised:** more than two physical boards. The flood above was
+  absorbed by a PC. An ESP32 spends
   ~100 µs checking each tag, so ~10 000 frames/s would take its whole CPU —
   authentication stops forgery, not denial of service.
 

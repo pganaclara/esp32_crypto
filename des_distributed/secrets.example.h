@@ -6,7 +6,7 @@
 // real values and is safe to publish.
 #pragma once
 
-// Wi-Fi access point (needed by the IP transports; not by loopback).
+// Wi-Fi access point the nodes join.
 #define WIFI_SSID "your-network"
 #define WIFI_PASS "your-password"
 

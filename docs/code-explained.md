@@ -683,8 +683,9 @@ because sequencing, acknowledgement, retransmission and atomicity are supplied
 end-to-end by the protocol itself — the classic end-to-end argument of Saltzer,
 Reed and Clark [17].
 
-That is also why the MQTT binding publishes at QoS 0 by default: broker-level QoS
-would redo, on every frame, work the two-phase commit already guarantees.
+It is also why a transport's own per-hop reliability, such as MQTT's QoS 1/2,
+would add nothing: it would redo, on every frame, work the two-phase commit
+already guarantees.
 
 The default binding is **UDP/IP multicast** (RFC 1112 [18]). It is an open
 standard with no broker, no library and no vendor, it runs on any BSD-socket

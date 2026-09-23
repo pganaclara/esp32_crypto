@@ -59,9 +59,6 @@
 #ifndef DES_FAMILY
 #define DES_FAMILY DES_FAMILY_LMOD_RED
 #endif
-#ifndef DES_TRANSPORT
-#define DES_TRANSPORT DES_TRANSPORT_UDP
-#endif
 
 // The cell key, from the same unversioned file the ESP32 sketch reads (the
 // Wi-Fi settings in it are simply unused here). -DDES_AUTH_KEY=... overrides.

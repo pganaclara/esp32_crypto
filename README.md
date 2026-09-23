@@ -60,7 +60,7 @@ homomorphic-esp32-ultrades/
 ├── des_distributed/                        DISTRIBUTED engine (its own sketch)
 │   ├── des_distributed.ino                   ESP32 entry point (config only)
 │   ├── des_generic.h                         the engine — no Arduino/ESP-IDF
-│   ├── des_transport.h                       UDP multicast · MQTT · loopback
+│   ├── des_transport.h                       UDP/IP multicast transport
 │   ├── host_main.cpp                         POSIX entry point
 │   ├── secrets.example.h                     template for secrets.h (Wi-Fi + cell key;
 │   │                                         secrets.h itself is in .gitignore)
@@ -68,26 +68,15 @@ homomorphic-esp32-ultrades/
 │   └── supervisor_data_*.h                   hard links to the root copies
 │
 ├── notebook/
-│   ├── generator_ultrades.ipynb            synthesise supervisors → .h
-│   └── generator_ultrades.ipynb.bak        pre-patch backup
+│   └── generator_ultrades.ipynb            synthesise supervisors → .h
 │
-├── docs/
-│   └── code-explained.md                   detailed walkthrough + references
-│
-└── thesis/                                 dissertation — not part of the code
-    ├── _work/                                LaTeX source (dissertacao, pfc, sii)
-    └── errlog/                               LaTeX build output
+└── docs/
+    └── code-explained.md                   detailed walkthrough + references
 ```
 
 Both `.ino` files sit in a folder whose name matches the sketch, which Arduino
 requires. The root doubles as the single-board sketch folder — that is why the
 generated headers live at the top level rather than in a `data/` subdirectory.
-
-`_work/` and `errlog/` moved into `thesis/` **together**, so the path from
-`_work/dissertacao` to `errlog` is still `../../errlog` — a LaTeX build using a
-relative output directory is unaffected. Anything pointing at an *absolute* path
-(an editor setting, a launch config) needs the `thesis/` prefix added. The inner
-names were left as they were to keep that change as small as possible.
 
 ---
 
@@ -287,8 +276,9 @@ Transport is pluggable because reliability is **end-to-end** (Saltzer, Reed &
 Clark 1984): the protocol supplies sequencing, acknowledgement, retransmission
 and atomicity, so a transport only has to be best-effort. Default is **UDP/IP
 multicast** (RFC 1112) — open, brokerless, portable, and the same substrate OPC
-UA PubSub and DDS use. An MQTT binding is included. ESP-NOW was implemented and
-then removed as vendor-specific.
+UA PubSub and DDS use. ESP-NOW was implemented and then removed as
+vendor-specific; an MQTT binding was removed because it was never tested
+against a live broker.
 
 Full design, protocol and transport analysis:
 [`des_distributed/README.md`](des_distributed/README.md).
@@ -645,8 +635,7 @@ Being explicit about what has and has not been checked:
 | Distributed protocol logic | **verified on host** — replayed against the real generated arrays for all problems; 0 silent divergences under injected loss up to 70 % |
 | Notebook Cell 6b logic | **verified** — executed against real supervisor data; rejects the old FMS sequence, accepts the new one |
 | Union fix is order-stable | **verified** — traces unchanged under shuffled pair orderings |
-| `host_main.cpp` POSIX build | **not compiled** — no POSIX toolchain available where it was written. It is guarded by `#if !defined(ARDUINO)` and verified inert under the Arduino build, so it cannot break the sketch |
-| MQTT binding | **not exercised** against a live broker |
+| `host_main.cpp` POSIX build | **verified** — built with g++ 13 on Ubuntu and run as several nodes over real UDP multicast (see `des_distributed/README.md`). Guarded by `#if !defined(ARDUINO)`, so it is inert under the Arduino build |
 | Real hardware | **run on ESP32-S3** — all three problems, every family, nine runs, all `PASS`. Single run each; no variance reported. |
 | Optimisation 6 correctness | **verified** — an independently written cost model predicted 190/145 decryptions *before* the change; hardware produced 190/145, matching step by step across all 44 steps of both families |
 

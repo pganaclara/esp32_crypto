@@ -51,19 +51,10 @@
 // extended_small_factory:  a1=0 a2=1 a3=2 controllable, b1=3 b2=4 b3=5 not:
 // #define DES_CONTROLLABLE_MASK 0x07
 
-// ── 3. transport ────────────────────────────────────────────────────────────
-//   DES_TRANSPORT_UDP       IP multicast, RFC 1112. Open, brokerless, portable.
-//   DES_TRANSPORT_MQTT      MQTT 3.1.1, ISO/IEC 20922. Use an existing broker.
-//   DES_TRANSPORT_LOOPBACK  no network — single-board bring-up.
-#define DES_TRANSPORT DES_TRANSPORT_UDP
-
+// ── 3. network: UDP/IP multicast (RFC 1112) ─────────────────────────────────
+// Open, brokerless, portable. Every node of the cell joins the same group.
 #define DES_MCAST_GROUP "239.192.7.1"
 #define DES_MCAST_PORT  5077
-
-// Only used when DES_TRANSPORT is DES_TRANSPORT_MQTT.
-#define DES_MQTT_HOST  "192.168.1.10"
-#define DES_MQTT_PORT  1883
-#define DES_MQTT_TOPIC "des/cell0/coord"
 
 // ── 4. experiment knobs ─────────────────────────────────────────────────────
 #define DES_ROUNDS            5     // production cycles
@@ -104,9 +95,6 @@
 #include "des_generic.h"
 
 static void link_up() {
-#if DES_TRANSPORT == DES_TRANSPORT_LOOPBACK
-    Serial.println("[link] loopback — no Wi-Fi needed");
-#else
     Serial.printf("[link] joining '%s'", WIFI_SSID);
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -116,24 +104,18 @@ static void link_up() {
     }
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println(" FAILED.");
-        Serial.println("[link] The IP transports need an access point. Set");
-        Serial.println("       WIFI_SSID / WIFI_PASS, or use DES_TRANSPORT_LOOPBACK");
-        Serial.println("       to bring a single board up without a network.");
+        Serial.println("[link] The nodes need an access point: check WIFI_SSID /");
+        Serial.println("       WIFI_PASS in secrets.h.");
         return;
     }
     Serial.printf(" ok — %s\n", WiFi.localIP().toString().c_str());
     // Multicast on a battery-saving station drops frames; keep the radio awake.
     WiFi.setSleep(false);
-#endif
 }
 
 // des_transport.h asks the platform which interface to join the group on.
 static uint32_t des_local_ipv4() {
-#if DES_TRANSPORT == DES_TRANSPORT_LOOPBACK
-    return 0;
-#else
     return (uint32_t)WiFi.localIP();
-#endif
 }
 
 void setup() {
