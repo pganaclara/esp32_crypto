@@ -31,10 +31,9 @@ moving to either is a transport swap, not an architecture change.
 
 ESP-NOW was rejected as vendor-specific: it exists only on Espressif silicon and
 no standards body specifies it. MQTT (ISO/IEC 20922) is open but was not chosen:
-the broker is a third failure domain between two controllers a metre apart; a
-well-tuned ESP32/MQTT path still measures 3 ms min / 12 ms avg / **72 ms max**
-round-trip, and the jitter is what hurts an interlock; and the broker sees every
-frame.
+the broker is a third failure domain between two controllers a metre apart;
+every message makes an extra trip through it, adding latency and jitter, and
+jitter is what hurts an interlock; and the broker sees every frame.
 
 The transport is pluggable **because reliability is end-to-end** (Saltzer, Reed
 & Clark 1984): the protocol supplies sequencing, acknowledgement, retransmission
