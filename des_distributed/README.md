@@ -26,8 +26,10 @@ Runs every header in this repo: `small_factory` (4 events, 1 supervisor),
 no broker, no library, no vendor. It runs unmodified on ESP32 (lwIP), Linux,
 *BSD, macOS, QNX, VxWorks — anything with BSD sockets — and joining the group
 *is* the discovery step. It is also the substrate the industrial standards use:
-OPC UA PubSub (IEC 62541-14) and DDS/RTPS both define UDP mappings over it, so
-moving to either is a transport swap, not an architecture change.
+OPC UA PubSub (IEC 62541-14) defines a brokerless UDP mapping over it, alongside
+broker-based MQTT and AMQP mappings meant for IT and cloud systems, and DDS/RTPS
+runs over UDP too, so moving to either is a transport swap, not an architecture
+change.
 
 ESP-NOW was rejected as vendor-specific: it exists only on Espressif silicon and
 no standards body specifies it. MQTT (ISO/IEC 20922) is open but was not chosen:
@@ -54,11 +56,12 @@ struct DesTransport {
 |---|---|---|---|---|---|
 | standard | RFC 1112 | ISO/IEC 20922 | IEC 62541-14 | OMG | **vendor** |
 | open-source stack | none needed | Mosquitto/EMQX | open62541 (MPL-2.0) | Cyclone (EPL-2.0), Fast DDS (Apache-2.0) | Espressif only |
-| broker | no | **yes** | no | no | no |
+| broker | no | **yes** | no over UDP/Ethernet; yes over MQTT/AMQP | no | no |
 | runs off-ESP32 | **yes** | yes | yes | yes | **no** |
 | status here | **implemented** | not chosen | ~100 lines to add | ~80 lines to add | rejected |
 
-Adding OPC UA PubSub or DDS means implementing those four functions. Neither is
+Adding OPC UA PubSub (its UDP mapping) or DDS means implementing those four
+functions. Neither is
 bundled because each pulls in a build system this sketch does not assume.
 
 ---
