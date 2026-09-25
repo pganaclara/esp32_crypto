@@ -393,15 +393,16 @@ same `secrets.h`. To run several nodes on **one** host, add `-DDES_MCAST_LOOP=1`
   | decryptions, node 1 / node 2 | 100 / 397 | 405 / 393 |
   | per step, cycle 1: latency / bound | 273 / 259 ms | 308 / 266 ms |
   | per step, 5 cycles: latency / bound | 160 / 146 ms | 207 / 154 ms |
-  | one board, cycle 1 (single-board sketch) | 233.9 ms (both cores) | 335.4 ms |
+  | one board, cycle 1 (single-board sketch, both cores, same day) | — | 346.0 ms |
   | initial enablement of `12` ("C1 finished") on node 1 | **1** — would accept it | **0** — rejects it |
 
-  With the full family, two boards are **8–21 % faster per step** than one in
-  cycle 1 (266–308 against 335.4 ms), because the work is balanced (405 against
-  393 decryptions). With the reduced family they are not (259–273 against 233.9
-  ms): node 2 does 80 % of the decryptions, and that single-board run used both
-  cores. The plant check of the full family costs 13–29 % more latency than the
-  reduced one, but only 3–5 % at the bound.
+  The comparison with one board is made with the **full local-modular family
+  only**: the reduced family cannot complete the plant check, so it is not the
+  same system. Against a single-board run of the full family made the same day
+  (346.0 ms per step in cycle 1, both cores, 190 decryptions), two boards take
+  **266–308 ms, 11–23 % less**, because the work is balanced (405 against 393
+  decryptions), although each node uses one core where the single board uses
+  two.
 * **Not exercised:** more than two physical boards. The flood above was absorbed
   by a PC; an ESP32 spends ~100 µs checking each tag, so ~10 000 frames/s would
   take its whole CPU — authentication stops forgery, not denial of service.

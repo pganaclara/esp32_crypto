@@ -123,7 +123,7 @@ ciphertext copy per pair; converging active sources are combined homomorphically
 | 2 | Persistent decompressed cache | Keep every cell as an `mbedtls_ecp_point` so the hot path never runs a modular square root. |
 | 3 | Skip-`g_zero` summands | Inactive cells equal the global `Enc(0)` and are skipped — rows sum 1–2 cells instead of dozens. |
 | 4 | Fused row-sum + decrypt | One `mbedtls_ecp_muladd` does the secret scalar mul and the final add. |
-| 5 | Dual-core split | Work units split across both cores. Gain 8–10 %, not 2×: mbedTLS serialises scalar muls on the one MPI peripheral. |
+| 5 | Dual-core split | Work units split across both cores (sketches with two or more supervisors). Steps that decrypt several sums get 11–24 % faster; steps with one decryption gain nothing. |
 | 6 | Share identical row sums | Rows are grouped by their set of non-`Enc(0)` cells; each set is decrypted once. 2.7–4.6× on `fms`. |
 
 ---

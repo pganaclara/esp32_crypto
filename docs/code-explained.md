@@ -431,12 +431,27 @@ build a work list (main core), decrypt the work list across both cores, then emi
 the enablement bitmap. A persistent worker task on core 0 is woken by semaphore
 rather than respawned per step.
 
-**Honest caveat, now measured:** 8–10 %, not 2×. Across the nine hardware runs,
-cost per decryption is 68.6–71.0 ms on the dual-core configurations and
-75.1–80.9 ms on the single-core ones (§4.6). mbedTLS serialises every scalar
-multiplication on the one MPI peripheral, so the second core spends most of its
-time waiting. The parallelisation is correct; the hardware defeats it. Reported
-as a negative result rather than quietly dropped.
+The split only runs when a benchmark has two or more supervisors; with one
+(every `small_factory` family and the `extended_small_factory` monolithic) the
+sketch prints `Cores used: 1 (single)`.
+
+**Measured:** comparing the single-board sketch (two cores) against the same steps on node 2 of the distributed engine (one core), with the same decryption count:
+
+| step (fms) | decryptions | two cores | one core | gain |
+|---|---|---|---|---|
+| `61`, reduced | 6 | 421.3 ms | 486.9 ms | 13 % |
+| `65`, reduced | 3 | 212.3 ms | 238.4 ms | 11 % |
+| `63`, reduced | 2 | 126.0 ms | 152.6 ms | 17 % |
+| `61`, local modular | 4 | 235.8 ms | 312.0 ms | 24 % |
+| `65`, local modular | 4 | 250.0 ms | 317.3 ms | 21 % |
+| `71`–`74`, `81`, `82` | 1 | ~76 ms | ~77 ms | none |
+
+So the second core saves 11–24 % on steps that decrypt several sums and nothing
+on steps with a single decryption — far from 2×. (An earlier version of this
+section put the gain at 8–10 % by sorting the nine runs into "dual-core" and
+"single-core" by their cost per decryption. That sorting was wrong: the cost per
+decryption depends mostly on how wide the row sums are, and the runs with one
+supervisor were the only single-core ones.)
 
 ### 4.6 Measured: what actually limits performance
 
@@ -459,12 +474,11 @@ supervisors.
 
 **Runtime is `decryptions × scalar_mul`.** Everything else the firmware does is
 noise, so the only software lever is reducing the *count* of decryptions. That is
-what §4.1 and §4.7 do, and it is why §4.5 achieves nothing.
+what §4.1 and §4.7 do, and it is why §4.5 achieves comparatively little.
 
-**Optimisation 5 buys 8–10 %, not 2×.** Dual-core runs land at 68.6–71.0 ms per
-decryption, single-core ones at 75.1–80.9. mbedTLS serialises every scalar
-multiplication on the one MPI peripheral. Worth reporting as a negative result:
-the parallelisation is correct and the hardware defeats it.
+**Optimisation 5 buys 11–24 % on steps with several decryptions, not 2×** (§4.5).
+The cost per decryption above varies mainly with the width of the row sums, not
+with the number of cores.
 
 **Correction — the ESP32-S3 has no ECC accelerator.** An earlier version of this
 document claimed roughly 10 ms per scalar multiplication on the S3 via a
