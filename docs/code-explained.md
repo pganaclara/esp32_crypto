@@ -39,9 +39,9 @@ core essentially verbatim. Read the sketch first; the engine adds distribution o
 top of an identical inner loop.
 
 Measured end state, ESP32-S3, all families `PASS` against the cleartext oracle:
-37.5 ms per supervisory decision on `small_factory`, 50.0 ms on
-`extended_small_factory`, 233.9 ms on `fms` (31 events, 7 supervisors, largest
-164 states). Full tables in §4.6.
+37.5 ms per step on `small_factory`, 50.0 ms on
+`extended_small_factory`, 233.9 ms on `fms` (44-step trace, 7 supervisors,
+largest 164 states). Full tables in §4.6.
 
 ---
 
@@ -469,7 +469,7 @@ ESP32-S3, Arduino core 3.3.8, all three problems, every run `PASS`:
 | | reduced | **233.9 ms** | 145 | 71.0 |
 
 A single scalar multiplication measures **69 ms**. Every ms-per-decryption figure
-lands between 68.6 and 80.9, across problems spanning 4 to 31 events and 1 to 7
+lands between 68.6 and 80.9, across traces of 4 to 44 steps and 1 to 7
 supervisors.
 
 **Runtime is `decryptions × scalar_mul`.** Everything else the firmware does is
@@ -574,8 +574,9 @@ The key observation for distribution is that this decomposition is **not
 arbitrary** — it follows the coupling structure of the plant. Each supervisor
 touches only the events of its own specification and the plants those events
 belong to. So the partition that synthesis already produced *is* the partition
-that minimises inter-node communication. For `extended_small_factory`, 4 of 6
-events need no communication at all; for FMS over three nodes, 16 of 31.
+that minimises inter-node communication. For `extended_small_factory`, 4 of its 6
+steps need no communication at all; for FMS over three nodes, 22 of the 44
+steps of a cycle.
 
 Splitting one logical supervisor across controllers that each see only part of
 the event set is the **decentralised control** problem of Rudie and Wonham [10],

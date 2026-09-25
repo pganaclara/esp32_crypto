@@ -14,9 +14,9 @@ host_main.cpp        POSIX entry point   (Linux / *BSD / macOS)
 secrets.example.h    template for secrets.h — Wi-Fi + cell key (secrets.h is not versioned)
 ```
 
-Runs every header in this repo: `small_factory` (4 events, 1 supervisor),
-`extended_small_factory` (6 events, 2 supervisors) and `fms` (31 events,
-7 supervisors, largest 164 states).
+Runs every header in this repo: `small_factory` (4-step trace, 1 supervisor),
+`extended_small_factory` (6-step trace, 2 supervisors) and `fms` (44-step
+trace, 7 supervisors, largest 164 states).
 
 ---
 
@@ -269,7 +269,7 @@ unrecognised defaults to controllable, the fail-safe direction. For a paper, set
 
 **Partitioning.** The default even contiguous block partition keeps supervisors
 that share events together and so minimises the shared set; for FMS over 3 nodes
-it leaves **16 of 31 events traffic-free**. Override with `DES_SUP_NODE_MAP` when
+it leaves **22 of the 44 steps of a cycle traffic-free**. Override with `DES_SUP_NODE_MAP` when
 a machine's actuator lives on a specific board.
 
 ---

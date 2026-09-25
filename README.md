@@ -167,13 +167,13 @@ cleartext oracle at every step. Measured `scalar_mul` = 69 ms, `muladd` = 5 ms.
 | problem | family | sups | ciphertext | warm-up | avg/step | min | max | decryptions |
 |---|---|---|---|---|---|---|---|---|
 | `small_factory` | monolithic | 1 | 300 B | 237 ms | 77.8 ms | 74.9 | 85.4 | 4 |
-| 4 events, 4 steps | local modular | 1 | 300 B | 239 ms | 77.5 ms | 74.8 | 85.0 | 4 |
+| 4 steps | local modular | 1 | 300 B | 239 ms | 77.5 ms | 74.8 | 85.0 | 4 |
 | | **reduced** | 1 | **100 B** | 189 ms | **37.5 ms** | 0.16 | 74.9 | **2** |
 | `extended_small_factory` | monolithic | 1 | 900 B | 487 ms | 94.4 ms | 75.5 | 126.1 | 7 |
-| 6 events, 6 steps | local modular | 2 | 600 B | 513 ms | 91.4 ms | 74.9 | 120.6 | 8 |
+| 6 steps | local modular | 2 | 600 B | 513 ms | 91.4 ms | 74.9 | 120.6 | 8 |
 | | **reduced** | 2 | **200 B** | 352 ms | **50.0 ms** | 0.18 | 75.0 | **4** |
 | `fms` | monolithic | — | *omitted, exceeds flash* | | | | | |
-| 31 events, 44 steps | local modular | 7 | 16 350 B | 12 358 ms | 335.4 ms | 75.4 | 1 423.7 | 190 |
+| 44 steps | local modular | 7 | 16 350 B | 12 358 ms | 335.4 ms | 75.4 | 1 423.7 | 190 |
 | | **reduced** | 7 | **1 850 B** | 4 917 ms | **233.9 ms** | 0.19 | 916.4 | **145** |
 
 * **Runtime is decryptions × scalar multiplication.** Time per decryption ranges
