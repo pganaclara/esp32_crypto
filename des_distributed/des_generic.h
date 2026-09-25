@@ -40,10 +40,12 @@
 // permission would be meaningless; it gets a reliable notification instead.
 //
 // Concurrency: participants hold a lock between VOTE-YES and COMMIT/ABORT, so
-// two initiators can never interleave transactions on the same supervisor.
-// Deadlock is prevented by WOUND-WAIT (Rosenkrantz et al. 1978): a lower-
-// numbered initiator preempts a higher-numbered one, so the wait-for graph can
-// never contain a cycle. Both then make progress on retry.
+// two initiators can never interleave transactions on the same supervisor. A
+// YES is never withdrawn for another request: a locked participant refuses all.
+// An initiator still collecting votes yields to an older (lower-numbered)
+// requester: WOUND-WAIT (Rosenkrantz et al. 1978). Every request is answered
+// at once, so no cycle of waits can form; a refused initiator has applied
+// nothing, and retries with backoff.
 //
 // Loss is handled by retransmission until every participant acknowledges; the
 // per-sender sequence number only rejects duplicates. A peer that reboots is
@@ -324,7 +326,7 @@ struct Supervisor {
 
 // Bumped whenever the wire format or its meaning changes; part of the config
 // fingerprint, so boards flashed from different versions refuse each other.
-#define DES_PROTO_VERSION 5
+#define DES_PROTO_VERSION 6
 
 enum : uint8_t {
     M_HELLO = 1, M_REQ, M_VOTE, M_COMMIT, M_NOTIFY,
@@ -1499,17 +1501,16 @@ static void dispatch(const DesFrame& f) {
                 break;
             }
             if (g_init_phase == 1) g_wounded = true;
-            // Wound-wait, participant side: a lower-numbered initiator preempts
-            // a higher-numbered one. Nothing has been applied while a lock is
-            // held, so preempting is always safe, and it makes a wait-for cycle
-            // impossible.
+            // A YES already cast is never withdrawn, whoever asks: its
+            // initiator may have committed on it, and nothing would tell it the
+            // vote was gone — the two-phase-commit rule that a prepared
+            // participant cannot abort on its own. The refusal is immediate,
+            // so no initiator ever waits on another's lock and no cycle of
+            // waits can form; the refused one aborts, having applied nothing,
+            // and backs off before retrying (drive_one).
             if (lock_held() && g_lock_by != f.src) {
-                if (f.src < g_lock_by) {
-                    DES_REACT_TAG();
-                    DES_LOG("wound       node %d preempts node %d\n",
-                            (int)f.src, (int)g_lock_by);
-                    g_lock_by = 0;
-                } else { tx(M_VOTE, f.ev, f.seq, 0); break; }       // busy -> no
+                tx(M_VOTE, f.ev, f.seq, 0);                          // busy -> no
+                break;
             }
             bool ok = local_enabled(f.ev);
             if (ok) { g_lock_by = f.src; g_lock_t0 = des_millis(); }

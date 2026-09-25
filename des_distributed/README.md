@@ -92,11 +92,14 @@ every frame to every node, so the others ignore it.
 **Concurrency.** Participants hold a lock between `VOTE`-yes and
 `COMMIT`/`ABORT`, so two initiators can never interleave transactions on the same
 supervisor, and a locked node fires none of its own events until the transaction
-settles — its YES was a promise about its current state. An initiator collecting
-votes answers other requests by **wound-wait** (Rosenkrantz, Stearns & Lewis
-1978): an older (lower-numbered) requester wounds it and it aborts its own
-attempt; a younger one is told no, so the wait-for graph cannot contain a cycle.
-Preemption is safe because nothing has been applied while a lock is held. Once
+settles — its YES was a promise about its current state. That YES is never
+withdrawn, whoever asks next: its initiator may already have committed on it, and
+nothing would tell it the vote was gone. So a locked participant refuses every
+other request. An initiator collecting votes answers other requests by
+**wound-wait** (Rosenkrantz, Stearns & Lewis 1978): an older (lower-numbered)
+requester wounds it and it aborts its own attempt; a younger one is told no.
+Every request is answered at once, so no cycle of waits can form; a refused
+initiator has applied nothing, and retries with exponential backoff. Once
 every vote is in, the initiator sends `COMMIT` first and applies locally second,
 so the participants' homomorphic steps run in parallel with its own.
 
@@ -289,7 +292,7 @@ a machine's actuator lives on a specific board.
      as `FAILED AUTHENTICATION` and never joins.
 3. Flash each board with a different `DES_NODE_ID`. At boot each prints
    `[init] config fingerprint XXXXXXXX`; the values must match (fms / 2 nodes /
-   lockstep off → `6e52cd12` with `LMOD`, `c6a8a0da` with `LMOD_RED`).
+   lockstep off → `edbd7971` with `LMOD`, `d79ed5b9` with `LMOD_RED`).
 
 On an **ESP32-S3** on its native USB port, set `USB CDC On Boot: Enabled`; a
 board-package update can reset it, and the symptom is a blank Serial Monitor.

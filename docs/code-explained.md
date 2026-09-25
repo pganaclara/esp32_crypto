@@ -637,11 +637,16 @@ With several initiators, two transactions could interleave on a shared
 participant and corrupt its state. Participants therefore hold a lock between
 voting yes and receiving COMMIT/ABORT.
 
-Locks invite deadlock, so the engine uses **wound-wait** (Rosenkrantz, Stearns
-and Lewis [14]): a lower-numbered initiator preempts a higher-numbered one. Since
-nothing has been applied while a lock is held, preemption is always safe, and
-because preference follows a total order on node ids the wait-for graph cannot
-contain a cycle. Both transactions still make progress on retry.
+A yes vote is never withdrawn for another request: its initiator may already
+have committed on it,
+and nothing would tell it the vote was gone — the two-phase-commit rule that a
+prepared participant cannot abort on its own. A locked participant therefore
+refuses every other request, older or younger. Between initiators the engine
+uses **wound-wait** (Rosenkrantz, Stearns and Lewis [14]): a node still
+collecting votes for its own event aborts it when an older (lower-numbered) node
+asks for its vote, and tells a younger one no. Every request is answered at
+once, so no initiator waits on another's lock and no cycle of waits can form. A
+refused initiator has applied nothing, and retries with exponential backoff.
 
 This mirrors, at protocol level, what Schouten et al. [15] found necessary when
 distributing a synthesised supervisor across PLCs: mutual exclusion is what makes
