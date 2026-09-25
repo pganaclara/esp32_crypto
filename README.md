@@ -160,8 +160,8 @@ Protocol, transport analysis and the two-board results:
 
 ## Benchmark results
 
-Single board, **ESP32-S3** @ 240 MHz, Arduino core 3.3.8, secp192r1, scalar
-blinding on. All nine runs `PASS`: every homomorphic enablement vector matched the
+Single board, **ESP32-S3** @ 240 MHz, Arduino core 3.3.12 for `fms` (3.3.8 for
+the two small factories), secp192r1, scalar blinding on. All nine runs `PASS`: every homomorphic enablement vector matched the
 cleartext oracle at every step. Measured `scalar_mul` = 69 ms, `muladd` = 5 ms.
 
 | problem | family | sups | ciphertext | warm-up | avg/step | min | max | decryptions |
@@ -173,8 +173,8 @@ cleartext oracle at every step. Measured `scalar_mul` = 69 ms, `muladd` = 5 ms.
 | 6 steps | local modular | 2 | 600 B | 513 ms | 91.4 ms | 74.9 | 120.6 | 8 |
 | | **reduced** | 2 | **200 B** | 352 ms | **50.0 ms** | 0.18 | 75.0 | **4** |
 | `fms` | monolithic | — | *omitted, exceeds flash* | | | | | |
-| 44 steps | local modular | 7 | 16 350 B | 12 358 ms | 335.4 ms | 75.4 | 1 423.7 | 190 |
-| | **reduced** | 7 | **1 850 B** | 4 917 ms | **233.9 ms** | 0.19 | 916.4 | **145** |
+| 44 steps | local modular | 7 | 16 350 B | 12 828 ms | 346.0 ms | 75.8 | 1 467.7 | 190 |
+| | **reduced** | 7 | **1 850 B** | 5 160 ms | **241.1 ms** | 0.21 | 955.0 | **145** |
 
 * **Runtime is decryptions × scalar multiplication.** Time per decryption ranges
   68.6–80.9 ms across the runs, against 69 ms for one scalar multiplication;

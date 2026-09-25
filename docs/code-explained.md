@@ -40,7 +40,7 @@ top of an identical inner loop.
 
 Measured end state, ESP32-S3, all families `PASS` against the cleartext oracle:
 37.5 ms per step on `small_factory`, 50.0 ms on
-`extended_small_factory`, 233.9 ms on `fms` (44-step trace, 7 supervisors,
+`extended_small_factory`, 241.1 ms on `fms` (44-step trace, 7 supervisors,
 largest 164 states). Full tables in §4.6.
 
 ---
@@ -177,7 +177,7 @@ Boolean, so the scheme's main practical weakness never materialises.
 What it costs in practice: one blinded scalar multiplication, measured at
 **69 ms** on ESP32-S3, and that single operation accounts for essentially the
 whole runtime (§4.6). A supervisory decision therefore costs one scalar
-multiplication — 37.5 ms per step on `small_factory`, 233.9 ms on `fms`.
+multiplication — 37.5 ms per step on `small_factory`, 241.1 ms on `fms`.
 
 The soundness condition is that the summed `m` never wraps modulo `N`. Rows sum
 at most `n` indicator bits (`n ≤ 164` here) against `N ≈ 2¹⁹²`, so wrap-around is
@@ -343,7 +343,7 @@ something this implementation settles.
 ## 4. The six optimisations
 
 Measured end state on ESP32-S3: **37.5 ms/step** on `small_factory`,
-**50.0 ms** on `extended_small_factory`, **233.9 ms** on `fms` — all for the
+**50.0 ms** on `extended_small_factory`, **241.1 ms** on `fms` — all for the
 reduced family, which after optimisation 6 is the fastest everywhere.
 
 Each optimisation is sound for a specific reason, and the reasons matter more
@@ -455,7 +455,8 @@ supervisor were the only single-core ones.)
 
 ### 4.6 Measured: what actually limits performance
 
-ESP32-S3, Arduino core 3.3.8, all three problems, every run `PASS`:
+ESP32-S3, Arduino core 3.3.12 for `fms` and 3.3.8 for the two small factories,
+every run `PASS`:
 
 | problem | family | avg/step | decryptions | ms per decryption |
 |---|---|---|---|---|
@@ -465,8 +466,8 @@ ESP32-S3, Arduino core 3.3.8, all three problems, every run `PASS`:
 | `extended_small_factory` | monolithic | 94.4 ms | 7 | 80.9 |
 | | local modular | 91.4 ms | 8 | 68.6 |
 | | reduced | **50.0 ms** | 4 | 75.0 |
-| `fms` | local modular | 335.4 ms | 190 | 77.7 |
-| | reduced | **233.9 ms** | 145 | 71.0 |
+| `fms` | local modular | 346.0 ms | 190 | 80.1 |
+| | reduced | **241.1 ms** | 145 | 73.2 |
 
 A single scalar multiplication measures **69 ms**. Every ms-per-decryption figure
 lands between 68.6 and 80.9, across traces of 4 to 44 steps and 1 to 7
@@ -509,7 +510,7 @@ phase 2 decrypts each once; a new phase 2b fans each result out. The grouping ke
 is, for every cell in the non-zero list, whether the row covers it — which is
 exactly membership of `S`, not an approximation.
 
-| `fms` | before | after | gain |
+| `fms` (core 3.3.8) | before | after | gain |
 |---|---|---|---|
 | local modular | 916.6 ms/step, 576 dec. | 335.4 ms, 190 dec. | 2.7× |
 | reduced | 1 078.8 ms/step, 745 dec. | 233.9 ms, 145 dec. | 4.6× |
