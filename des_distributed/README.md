@@ -252,6 +252,7 @@ editing.
 | `DES_SUP_NODE_MAP` | *(even block partition)* | explicit supervisor→node, e.g. `{1,1,1,2,2,3,3}` |
 | `DES_CONTROLLABLE_MASK` | *(inferred)* | override the controllability inference |
 | `DES_BENCH_LOCKSTEP` | `0` | 0 = each node walks freely, waiting only on SHARED events (recommended); 1 = every node replays the whole trace — reproducible, but needs the nodes to keep step |
+| `DES_WORK_MS` | `250` (the sketch sets `0`) | simulated machine time before each uncontrollable event; `0` times the cryptography and the protocol alone, as the single-board sketch does. Every node prints `-- cycle N/R done at X ms --` on a run clock common to all nodes (it starts when node 1's round-trip probe ends), and repeats the values in its summary; a cycle is over at the latest node's value |
 | `DES_SIMULATE_LOSS_PCT` | `0` | inject loss: `30` exercises retransmission, `90` forces a SAFE HALT |
 | `DES_RXQ_LEN` | `64` | receive queue depth, power of two — see §3a |
 | `DES_SYNC_TIMEOUT_MS` | `60000` | how long an owner waits for its participants to reach a shared step — see §3b |
@@ -368,41 +369,49 @@ same `secrets.h`. To run several nodes on **one** host, add `-DDES_MCAST_LOOP=1`
   | trace edited so that `12` comes before `11` | node 1: `IMPOSSIBLE`, `SKIP`; the steps that depended on it are skipped too |
   | extended_small_factory, full local modular, lockstep + monolithic cross-check | PASS |
 
-* **Two ESP32-S3 boards, fms, full local modular, 5 cycles, run twice** (the
-  sketch's setting since the plant check). Both runs: all 220 steps, 0 skipped,
-  0 retransmissions, 0 reports rejected by the plant check, oracle PASS on both,
-  no halt. Decryptions **405 + 393** (85 + 105 in cycle 1, then 80 + 72 per
-  cycle) in both, equal to the model's prediction made before the first; the
-  time per step differs by 0.1 % between them. Protocol time per controllable
-  shared event, second run: median 17.8 ms against an 18.2 ms mean round trip.
-  The first run saw three Wi-Fi delays of 0.16–0.69 s in its last cycle, with no
-  loss and no retransmission (mean 44.6 ms, median 14.6 ms); the second did not.
-
-  **How to count time when the nodes run in parallel.** Two measures bound it.
-  *Latency*: count each trace step once — a local step at the node that fires
-  it, a shared step at the slower node — and average; that is the time until
-  the step is decided everywhere, what the single-board sketch reports per
-  step. *Bound*: the busier node's total time divided by the steps, i.e. what
-  perfect overlap of the two nodes' work would give. The true time per step
-  lies between them. A node's own `all events` average is neither: it leaves
-  out the other node's local events, its longer applies, and the waits.
+* **Two ESP32-S3 boards, fms, full local modular, 5 cycles, three runs** (the
+  sketch's setting since the plant check): two with `DES_WORK_MS 250`, and a
+  third with `DES_WORK_MS 0` to time whole cycles. All three: all 220 steps, 0
+  skipped, 0 retransmissions, 0 reports rejected by the plant check, oracle PASS
+  on both nodes, no halt. Decryptions **405 + 393** (85 + 105 in cycle 1, then
+  80 + 72 per cycle) every time, equal to the model's prediction made before
+  the first; the homomorphic time of each step differs by at most 0.1 %
+  between runs. Protocol time per controllable shared event: median 17.8 ms
+  against an 18.2 ms mean round trip (second run), 13.2 against 13.9 ms
+  (third). The first run saw three Wi-Fi delays of 0.16–0.69 s in its last
+  cycle, with no loss and no retransmission (mean 44.6 ms, median 14.6 ms); the
+  others did not.
 
   | fms, two ESP32-S3, 5 cycles | reduced | full local modular (2nd run) |
   |---|---|---|
   | encrypted cells, node 1 / node 2 | 11 / 26 | 75 / 252 |
   | decryptions, node 1 / node 2 | 100 / 397 | 405 / 393 |
-  | per step, cycle 1: latency / bound | 273 / 259 ms | 308 / 266 ms |
-  | per step, 5 cycles: latency / bound | 160 / 146 ms | 207 / 154 ms |
-  | one board, cycle 1 (single-board sketch, both cores, same day) | — | 346.0 ms |
   | initial enablement of `12` ("C1 finished") on node 1 | **1** — would accept it | **0** — rejects it |
 
-  The comparison with one board is made with the **full local-modular family
-  only**: the reduced family cannot complete the plant check, so it is not the
-  same system. Against a single-board run of the full family made the same day
-  (346.0 ms per step in cycle 1, both cores, 190 decryptions), two boards take
-  **266–308 ms, 11–23 % less**, because the work is balanced (405 against 393
-  decryptions), although each node uses one core where the single board uses
-  two.
+  **One board against two.** The comparison uses the **full local-modular
+  family only**: the reduced family cannot complete the plant check, so it is
+  not the same system. Both setups are measured the same way: the time to
+  complete cycle 1 of the trace, without machine time, divided by its 44 steps.
+  The single-board sketch reports it directly (`Total` 15 224.8 ms, `Avg` 346.0
+  ms, both cores, 190 decryptions, run the same day). The third two-board run
+  (`DES_WORK_MS 0`) prints every cycle's end on a run clock common to both
+  nodes; a cycle is over at the later node, node 2 every time (13 065.0,
+  20 422.2, 27 808.4, 35 154.2, 42 494.2 ms):
+
+  | fms, full local modular, time per step | one board | two boards |
+  |---|---|---|
+  | cycle 1 | **346.0 ms** (15.2 s) | **296.9 ms** (13.1 s) |
+  | cycles 2–5 | not run | 167.2 ms |
+
+  Two boards finish cycle 1 **14 % sooner**, because the work is balanced (405
+  against 393 decryptions), although each node uses one core where the single
+  board uses two. Node 2's clock starts at node 1's last probe `PING`, some
+  30 ms before node 1's, so these times err on the slow side by that much.
+  Before this run, a replay of the second run's logged step times (each node's
+  steps in order, a shared step starting once the participant has reached it)
+  had predicted 298.3 and 168.3 ms. A node's own `all events` average (201.7 ms
+  on node 1 in the second run) is not the system's time per step: it leaves out
+  the other node's local events, the applies and the waits.
 * **Not exercised:** more than two physical boards. The flood above was absorbed
   by a PC; an ESP32 spends ~100 µs checking each tag, so ~10 000 frames/s would
   take its whole CPU — authentication stops forgery, not denial of service.

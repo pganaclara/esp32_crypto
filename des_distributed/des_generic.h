@@ -584,6 +584,15 @@ static bool     g_in_he     = false;    // a homomorphic step is in flight
 // number is where this node is in SIM_SEQ.
 static int g_cycle = 0, g_step = -1;
 
+// Run clock. Each node prints the end of every cycle on it, so the time the
+// nodes take together for a cycle is the LATEST of their prints. Node 1 starts
+// it when its round-trip probe ends and its run begins; the others restart it
+// on every probe PING, so their clocks start within about one round trip of
+// node 1's instead of while node 1 is still probing.
+static uint64_t g_run_t0 = 0;
+static double   g_cycle_end_ms[DES_ROUNDS];
+static int      g_cycles_done = 0;
+
 #define DES_STEP_TAG()  DES_LOG("c%-2d s%-3d ", g_cycle, g_step)
 #define DES_REACT_TAG() DES_LOG("    ·     ")
 
@@ -1475,7 +1484,7 @@ static void dispatch(const DesFrame& f) {
 
         switch (f.type) {
         case M_HELLO: break;
-        case M_PING:  tx(M_PONG, f.ev, f.seq); break;
+        case M_PING:  tx(M_PONG, f.ev, f.seq); g_run_t0 = des_micros(); break;
 
         case M_REQ: {
             if (!i_participate(f.ev)) break;             // not ours to vote on
@@ -1854,6 +1863,12 @@ static void print_summary() {
                 "%.1f s total\n     not protocol cost — the plant catching up; "
                 "kept out of the rows above\n", (unsigned)g_sync_n,
                 (g_sync_us / (double)g_sync_n) / 1000.0, g_sync_us / 1e6);
+    if (g_cycles_done) {
+        DES_LOG("  run clock, end of cycles 1..%d (ms):", g_cycles_done);
+        for (int c = 0; c < g_cycles_done; ++c) DES_LOG(" %.1f", g_cycle_end_ms[c]);
+        DES_LOG("\n     a cycle is over at the LATEST node's value; "
+                "DES_WORK_MS %d included\n", (int)DES_WORK_MS);
+    }
     DES_LOG("  ----------------------------------------------------------\n");
     if (n) {
         DES_LOG("  all events            n=%-4u avg %8.2f ms  (HE %7.2f + net %7.2f)\n",
@@ -2174,7 +2189,11 @@ static void run_benchmark() {
     DES_LOG("  RUN — SIM_SEQ driver — %d cycles x %d steps — %s\n",
             (int)DES_ROUNDS, (int)SIM_SEQ_LEN, DES_FAMILY_NAME);
     DES_LOG("  columns: cN sNN = cycle/step of MY walk; · = a peer caused this\n");
+    DES_LOG("  'done at': run clock, common to all nodes; a cycle is over at the\n");
+    DES_LOG("  LATEST node's print, machine time (DES_WORK_MS %d) included\n",
+            (int)DES_WORK_MS);
     DES_LOG("============================================================\n");
+    if (DES_NODE_ID == 1 || !g_run_t0) g_run_t0 = des_micros();
 
     // occ_ctr[gi] = how many times gi has appeared so far. Identical on every
     // node, because every node walks the identical trace.
@@ -2239,6 +2258,11 @@ static void run_benchmark() {
                     break;
                 }
             }
+        }
+        if (!g_safe_halt) {
+            g_cycle_end_ms[g_cycles_done++] = (des_micros() - g_run_t0) / 1000.0;
+            DES_LOG("-- cycle %d/%d done at %.1f ms --\n", round, (int)DES_ROUNDS,
+                    g_cycle_end_ms[g_cycles_done - 1]);
         }
     }
     print_summary();

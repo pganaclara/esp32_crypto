@@ -61,7 +61,9 @@
 
 // ── 4. experiment knobs ─────────────────────────────────────────────────────
 #define DES_ROUNDS            5     // production cycles
-#define DES_WORK_MS         250     // simulated machine processing time
+#define DES_WORK_MS           0     // simulated machine processing time;
+                                    //     0 = cryptography and protocol alone,
+                                    //     to compare with the single-board sketch
 #define DES_SIMULATE_LOSS_PCT 0     // try 30 to exercise retransmission,
                                     //     90 to force a SAFE HALT
 #define DES_BENCH_LOCKSTEP    0     // 0 = each node walks freely and waits only
