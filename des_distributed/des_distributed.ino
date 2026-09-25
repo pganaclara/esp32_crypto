@@ -32,11 +32,14 @@
 #define DES_NUM_NODES 2
 
 // Which synthesised family to distribute:
-//   DES_FAMILY_LMOD_RED  reduced local-modular  (smallest, fastest, default)
-//   DES_FAMILY_LMOD      full local-modular     (state-equivalent to monolithic)
+//   DES_FAMILY_LMOD      full local-modular: synthesised over the plant, so its
+//                        state tracks the machines and the plant check catches
+//                        every physically impossible uncontrollable event
+//   DES_FAMILY_LMOD_RED  reduced local-modular (smallest and fastest, but it
+//                        does not carry the plant: an impossible event may pass)
 //   DES_FAMILY_MONO      the monolithic supervisor (all on one node; useful as
 //                        the centralised baseline to measure against)
-#define DES_FAMILY DES_FAMILY_LMOD_RED
+#define DES_FAMILY DES_FAMILY_LMOD
 
 // Supervisor → node assignment. Omit for an even block partition, which keeps
 // supervisors that share events together and so minimises the shared set.
@@ -74,6 +77,12 @@
                                     //   — only with DES_BENCH_LOCKSTEP 1 and a header
                                     //   that has one (fms does not); the summary
                                     //   says when it is off and why.
+// Plant-check demonstration: at this step of cycle 1, the owner of the event
+// acts as if a sensor had reported it and prints ACCEPTED or REJECTED. Nothing
+// is applied. "12" = conveyor C1 finished, before C1 was ever started: the full
+// local-modular supervisors reject it, the reduced ones accept it.
+// #define DES_INJECT_EVENT   "12"
+// #define DES_INJECT_AT_STEP 0
 
 // ── 5. credentials: Wi-Fi and the frame authentication key ──────────────────
 // Kept in secrets.h, which is NOT versioned (.gitignore): the Wi-Fi password,

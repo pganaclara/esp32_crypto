@@ -10,8 +10,8 @@
 //
 //   build (the cell key comes from secrets.h, the same file the ESP32 reads;
 //   -DDES_AUTH_KEY='"..."' overrides it):
-//     g++ -std=c++17 -O2 -DDES_NODE_ID=1 -DDES_NUM_NODES=2 \
-//         -o des_node1 host_main.cpp -lmbedcrypto -lmbedx509 -lmbedtls
+//     g++ -std=c++17 -O2 -DDES_NODE_ID=1 -DDES_NUM_NODES=2 -o des_node1
+//         host_main.cpp -lmbedcrypto -lmbedx509 -lmbedtls      (one line)
 //
 //   run (one shell per node, same LAN segment):
 //     ./des_node1 1 2           # node 1 of 2

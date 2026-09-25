@@ -52,6 +52,12 @@
 // or a peer restarts after shared events, a node SAFE-HALTS rather than
 // continue on state that may have diverged. That is the Two Generals trade,
 // made explicit: safety preserved, liveness sacrificed.
+//
+// Plant check: a synthesised supervisor never disables an uncontrollable event
+// the plant can produce, so a reported uncontrollable event that ours disable is
+// physically impossible — a sensor fault or a forged report — and is rejected
+// rather than applied. Only supervisors synthesised over the plant (full local
+// modular, monolithic) catch every such event; a reduced one may allow it.
 // =============================================================================
 
 #pragma once
@@ -163,6 +169,16 @@
 #define DES_VERIFY_MONO 1
 #endif
 
+// Plant-check demonstration. At step DES_INJECT_AT_STEP of cycle 1, the owner of
+// event DES_INJECT_EVENT acts as if a sensor had just reported it and prints
+// whether the plant check would accept it. Nothing is applied, so the run is
+// otherwise unchanged. Off unless DES_INJECT_EVENT is defined, e.g.
+//   #define DES_INJECT_EVENT   "12"   // "conveyor C1 finished"...
+//   #define DES_INJECT_AT_STEP 0      // ...before C1 was ever started
+#ifndef DES_INJECT_AT_STEP
+#define DES_INJECT_AT_STEP 0
+#endif
+
 // =============================================================================
 // 2. Platform abstraction — the only four touchpoints
 // =============================================================================
@@ -256,6 +272,18 @@ static void des_sleep_ms(uint32_t ms) {
 #  define DES_SUPS   (&MONO_SUP)
 #  define DES_NSUPS  1
 #  define DES_FAMILY_NAME "MONOLITHIC"
+#endif
+
+// Whether the supervisors carry the plant. The full local-modular and the
+// monolithic supervisors are synthesised over the plant, so their state tracks
+// the machines: an uncontrollable event they disable is one no machine could
+// produce from here. Reduction merges states that differ only in behaviour the
+// plant cannot generate, so a reduced supervisor may allow such an event — it
+// relies on the plant never producing it.
+#if DES_FAMILY == DES_FAMILY_LMOD_RED
+#  define DES_FAMILY_HAS_PLANT 0
+#else
+#  define DES_FAMILY_HAS_PLANT 1
 #endif
 
 static_assert(DES_NODE_ID >= 1 && DES_NODE_ID <= DES_NUM_NODES,
@@ -376,7 +404,9 @@ static EvRoute g_route[EVENT_COUNT];
 static uint32_t g_my_node_bit = 1u << (DES_NODE_ID - 1);
 
 static uint32_t g_my_seq  = 0;                       // my outgoing COMMIT/NOTIFY seq
+#if DES_BENCH_LOCKSTEP
 static uint32_t g_ann_seq = 0;                       // my outgoing ANNOUNCE seq
+#endif
 static uint32_t g_seq_from[DES_NUM_NODES + 2];       // last commit applied, per sender
 static uint32_t g_ann_from[DES_NUM_NODES + 2];       // last announce seen, per sender
 // Highest occurrence of each event that its owner has RESOLVED — applied or
@@ -387,6 +417,7 @@ static uint32_t g_resolved_occ[EVENT_COUNT];
 // Highest occurrence of each event that each peer's driver has reached.
 static uint32_t g_at_occ[DES_NUM_NODES + 2][EVENT_COUNT];
 static uint32_t g_skips = 0;                         // inadmissible SIM_SEQ steps
+static uint32_t g_impossible = 0;                    // reports rejected by the plant check
 static uint32_t g_peer_seen = 0;                     // bitmask of nodes heard from
 
 static uint32_t g_epoch = 0;                         // mine, random per boot
@@ -608,6 +639,14 @@ static void he_yield() {
                         "changing only DES_NODE_ID.\n\n", (int)f.src);
             }
             continue;
+        }
+        // A node flagged earlier that now matches has been reflashed or has
+        // restarted with the right settings. It is accepted from here on, so
+        // the summary must not keep reporting it as ignored.
+        if (g_cfg_bad_from & (1u << (f.src - 1))) {
+            g_cfg_bad_from &= ~(1u << (f.src - 1));
+            DES_LOG("[net] node %d now runs the same configuration — accepted\n",
+                    (int)f.src);
         }
 #if DES_SIMULATE_LOSS_PCT > 0
         if ((int)(rand() % 100) < DES_SIMULATE_LOSS_PCT) continue;
@@ -1301,6 +1340,20 @@ static void participant_apply(const DesFrame& f) {
     if (!i_participate(f.ev)) return;
     uint32_t* last = &g_seq_from[f.src];
     if (f.seq <= *last) { tx(M_ACK, f.ev, f.seq); return; }        // duplicate
+    // PLANT CHECK, participant side (see fire()). Only a NOTIFY can get here
+    // disabled: for a COMMIT this node voted yes and has been locked since. An
+    // uncontrollable event cannot be refused — the owner reports it happened —
+    // but applying one our supervisors say no machine could produce would empty
+    // their state. The two nodes' models no longer agree, so halt instead.
+    if (!local_enabled(f.ev)) {
+        ++g_impossible;
+        DES_REACT_TAG();
+        DES_LOG("[!!]   %-4s  IMPOSSIBLE — reported by node %d, but no machine could "
+                "produce it here\n", ev_name(f.ev, nm), (int)f.src);
+        safe_halt("a peer reported an event this node's model says no machine "
+                  "could produce");
+        return;
+    }
     // ACCEPT AND ACKNOWLEDGE FIRST, APPLY SECOND.
     //
     // The apply is a full homomorphic step: measured at 3-4 s for one `fms`
@@ -1569,7 +1622,9 @@ static uint32_t collect(uint8_t type, uint32_t seq, uint32_t need,
 // it. Re-asking every 50 ms until the step timeout — which is what the driver
 // used to do — sends ~150 requests per blocked event, and that flood is
 // precisely what overruns a busy peer's receive mailbox.
-enum FireResult { FIRE_OK, FIRE_BLOCKED, FIRE_VETOED, FIRE_HALT };
+// FIRE_IMPOSSIBLE is final: an uncontrollable event this node's supervisors say
+// no machine could produce from here. Waiting will not make it possible.
+enum FireResult { FIRE_OK, FIRE_BLOCKED, FIRE_VETOED, FIRE_HALT, FIRE_IMPOSSIBLE };
 
 // The veto log is rate-limited: the first refusal of an event is printed in
 // full, the repeats are counted and rolled up by the driver when the wait ends.
@@ -1600,9 +1655,17 @@ static FireResult fire(int gi, uint32_t occ, uint64_t* he_us, uint64_t* net_us) 
             g_block_why = "my own supervisor disables it here";
             return FIRE_BLOCKED;
         }
+        // PLANT CHECK. A synthesised supervisor never disables an uncontrollable
+        // event the plant can produce — that is what controllability means. So
+        // if ours disable it, no machine could have produced it from here: a
+        // sensor fault, a forged report, or a model that does not match the
+        // plant. Applying it would empty the supervisors' state; reject it.
+        ++g_impossible;
+        g_block_why = "physically impossible here — rejected";
         DES_STEP_TAG();
-        DES_LOG("!!     %-4s  uncontrollable, but my supervisor disables it — "
-                "model/plant mismatch\n", nm);
+        DES_LOG("[!!]   %-4s  IMPOSSIBLE — uncontrollable, but no machine could "
+                "produce it from here; rejected (sensor fault or attack?)\n", nm);
+        return FIRE_IMPOSSIBLE;
     }
 
     // ---- local event: nobody else cares. Zero frames. ----
@@ -1817,6 +1880,13 @@ static void print_summary() {
     if (g_rxq_drops) DES_LOG(", %u DROPPED (queue full — raise DES_RXQ_LEN)",
                              (unsigned)g_rxq_drops);
     DES_LOG("\n");
+    DES_LOG("  plant check: %u event report%s rejected as physically impossible\n",
+            (unsigned)g_impossible, g_impossible == 1 ? "" : "s");
+    DES_LOG("     (%s)\n", DES_FAMILY_HAS_PLANT
+            ? "these supervisors carry the plant: an impossible uncontrollable "
+              "event is caught"
+            : "REDUCED supervisors do not carry the plant: an impossible event "
+              "may be accepted");
     if (g_skips) {
         DES_LOG("  !! %u STEPS SKIPPED — each SKIP line above says why. Firing a\n",
                 (unsigned)g_skips);
@@ -1952,12 +2022,12 @@ static bool drive_one(int gi, uint32_t occ, uint32_t timeout_ms) {
     g_veto_ev = -1; g_veto_repeat = 0;
     while (!g_safe_halt) {
         pump();
-        // Replaying a script is not the same as reacting to a plant. fire()
-        // deliberately does NOT block an uncontrollable event — a supervisor
-        // may not disable one. But when the event comes from a generated trace
-        // rather than a sensor, firing it while disabled would corrupt every
-        // supervisor downstream, so the scripted driver gates it here instead.
-        if (!local_enabled(gi)) {
+        // A controllable event my supervisors disable may become allowed once
+        // the plant moves on, so it is waited for. An uncontrollable one goes
+        // straight to fire(): by the time this node reaches the step, every
+        // earlier event that concerns its supervisors has been applied, so a
+        // disabled one is impossible, and fire() rejects it at once.
+        if (r.controllable && !local_enabled(gi)) {
             des_sleep_ms(5);
             if (des_millis() - t0 > timeout_ms) {
                 g_drive_why = "my own supervisor disables it here";
@@ -1981,6 +2051,7 @@ static bool drive_one(int gi, uint32_t occ, uint32_t timeout_ms) {
             return true;
         }
         if (fr == FIRE_HALT) { g_drive_why = "safe halt"; return false; }
+        if (fr == FIRE_IMPOSSIBLE) { g_drive_why = g_block_why; return false; }
         last = fr;
 
         // A veto is a decision, not a dropped packet. Only a state change on
@@ -2072,6 +2143,28 @@ static bool await_participants(int gi, uint32_t occ) {
     return true;
 }
 
+#ifdef DES_INJECT_EVENT
+// Plant-check demonstration (see DES_INJECT_EVENT): the question a real sensor
+// report of the event would face at this point, asked without applying it.
+static void inject_test() {
+    int gi = -1; char nm[16];
+    for (int g = 0; g < EVENT_COUNT; ++g)
+        if (!strcmp(ev_name(g, nm), DES_INJECT_EVENT)) gi = g;
+    if (gi < 0) {
+        DES_LOG("[test] DES_INJECT_EVENT \"%s\" is not an event of this problem\n",
+                DES_INJECT_EVENT);
+        return;
+    }
+    if (!i_am_owner(gi)) return;            // its sensor reports to its owner
+    bool ok = local_enabled(gi);
+    DES_STEP_TAG();
+    DES_LOG("[test] fake report of %s (%s): %s\n", DES_INJECT_EVENT,
+            g_route[gi].controllable ? "controllable" : "uncontrollable",
+            ok ? "ACCEPTED — the supervisors allow it here"
+               : "REJECTED — no machine could produce it here");
+}
+#endif
+
 // Replay the generated SIM_SEQ. Every node walks the same sequence but fires
 // only the events it owns, and meets its peers at the shared ones. Steps that
 // are not admissible are reported and skipped rather than forced — firing a
@@ -2097,6 +2190,9 @@ static void run_benchmark() {
             uint32_t occ = ++occ_ctr[gi];
             g_step = p;
             const EvRoute& r = g_route[gi];
+#ifdef DES_INJECT_EVENT
+            if (round == 1 && p == DES_INJECT_AT_STEP) inject_test();
+#endif
 
             if (i_am_owner(gi)) {
                 bool ok = true;

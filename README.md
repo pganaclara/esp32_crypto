@@ -144,7 +144,11 @@ Routing is derived at boot from the generated header:
 | shared + uncontrollable | `NOTIFY → ACK*`, retransmitted until acknowledged | 1 + p |
 
 An uncontrollable event cannot be vetoed: SCT forbids disabling it, and the plant
-has already done it. The protocol supplies sequencing, acknowledgement,
+has already done it. The same property gives a plant check: a reported
+uncontrollable event that a node's supervisors disable is one no machine could
+have produced, and is rejected. The full local-modular family, which carries the
+plant, catches every such event, so the sketch uses it; a reduced supervisor may
+let one through. The protocol supplies sequencing, acknowledgement,
 retransmission and atomicity end to end, so the transport only has to be
 best-effort: **UDP/IP multicast** (RFC 1112), open and brokerless. Every frame is
 signed with HMAC-SHA256/128 under the cell's key.

@@ -142,6 +142,23 @@ admissibility: a step the supervisors disable is skipped and reported, never
 fired. With `DES_BENCH_LOCKSTEP 1` and a header that carries a monolithic
 supervisor, the global trace is also replayed against it.
 
+**Plant check.** A synthesised supervisor never disables an uncontrollable event
+the plant can produce — that is what controllability means. So when a node's
+supervisors disable a reported uncontrollable event, no machine could have
+produced it from the current state: a sensor fault, a forged report, or a model
+that does not match the plant. The owner rejects it (`IMPOSSIBLE`, then `SKIP`);
+a participant that receives it in a `NOTIFY` cannot refuse it, and halts rather
+than empty its supervisors' state. How much this catches depends on the family.
+The **full local-modular** and the **monolithic** supervisors are synthesised
+over the plant, so their state tracks the machines and every impossible
+uncontrollable event is caught (for FMS, every machine is in some supervisor's
+local plant). A **reduced** supervisor merges states that differ only in
+behaviour the plant cannot generate, so it may accept an impossible event: at
+the start of FMS, the reduced S0 allows `12` ("C1 finished") although C1 was
+never started, and the full S0 does not (the boot line `[init] my enablement`
+shows `12=1` with the reduced family and `12=0` with the full one). This is why the sketch now uses
+`DES_FAMILY_LMOD`. The summary reports the count of rejected reports.
+
 ---
 
 ## 3. Running on real hardware
@@ -231,7 +248,7 @@ editing.
 |---|---|---|
 | `DES_DATA_HEADER` | extended_small_factory | any generated header |
 | `DES_NODE_ID` / `DES_NUM_NODES` | 1 / 2 | **different `DES_NODE_ID` per board** |
-| `DES_FAMILY` | `LMOD_RED` | `LMOD_RED`, `LMOD`, or `MONO` (centralised baseline) |
+| `DES_FAMILY` | `LMOD_RED` (the sketch sets `LMOD`) | `LMOD` (carries the plant: full plant check), `LMOD_RED` (smallest, but an impossible event may pass), or `MONO` (centralised baseline) |
 | `DES_SUP_NODE_MAP` | *(even block partition)* | explicit supervisor→node, e.g. `{1,1,1,2,2,3,3}` |
 | `DES_CONTROLLABLE_MASK` | *(inferred)* | override the controllability inference |
 | `DES_BENCH_LOCKSTEP` | `0` | 0 = each node walks freely, waiting only on SHARED events (recommended); 1 = every node replays the whole trace — reproducible, but needs the nodes to keep step |
@@ -239,6 +256,7 @@ editing.
 | `DES_RXQ_LEN` | `64` | receive queue depth, power of two — see §3a |
 | `DES_SYNC_TIMEOUT_MS` | `60000` | how long an owner waits for its participants to reach a shared step — see §3b |
 | `DES_MCAST_LOOP` | `0` | `1` to run several nodes on one host (testing) |
+| `DES_INJECT_EVENT` / `DES_INJECT_AT_STEP` | *(off)* / `0` | plant-check demonstration: at that step of cycle 1 the event's owner acts as if a sensor reported it and prints `ACCEPTED` or `REJECTED`; nothing is applied |
 
 **Controllability.** The generated header does not record it, so the engine
 infers it from the labels and **prints what it inferred at boot** — check that
@@ -270,7 +288,7 @@ a machine's actuator lives on a specific board.
      as `FAILED AUTHENTICATION` and never joins.
 3. Flash each board with a different `DES_NODE_ID`. At boot each prints
    `[init] config fingerprint XXXXXXXX`; the values must match (fms / 2 nodes /
-   LMOD_RED / lockstep off → `c6a8a0da`).
+   lockstep off → `6e52cd12` with `LMOD`, `c6a8a0da` with `LMOD_RED`).
 
 On an **ESP32-S3** on its native USB port, set `USB CDC On Boot: Enabled`; a
 board-package update can reset it, and the symptom is a blank Serial Monitor.
@@ -295,7 +313,7 @@ same `secrets.h`. To run several nodes on **one** host, add `-DDES_MCAST_LOOP=1`
 * **ESP32 build.** Compiles with `-Wall -Wextra` and zero warnings against ESP32
   Arduino core 3.3.12 (`xtensa-esp32s3-elf-g++`), across all three problems ×
   2 and 3 nodes × all three families × lockstep on and off.
-* **Two ESP32-S3 boards, fms, 5 cycles.** All 220 steps, 0 skipped, 0
+* **Two ESP32-S3 boards, fms, reduced family, 5 cycles.** All 220 steps, 0 skipped, 0
   retransmissions, oracle PASS on both, no halt. Decryptions **100 + 397**,
   equal step by step (240 of 240) to the model's prediction made before the
   run. On the owner, a shared controllable event takes **91 ms**, of which
@@ -339,6 +357,37 @@ same `secrets.h`. To run several nodes on **one** host, add `-DDES_MCAST_LOOP=1`
   | a whole run recorded, then replayed verbatim ×5 (615 frames) into a new run | new run complete, 44/44, no halt, no false "restarted" or "duplicate id"; 20 challenges |
   | every live frame resent with one bit flipped, plus HALTs with random tags — 1.8 M frames in 10 s | all rejected; run complete, 0 skips |
 
+* **Plant check, on Linux** (same test double; decryption counts are exact, as
+  the rows above show):
+
+  | scenario | result |
+  |---|---|
+  | fms, 2 nodes, full local modular, 5 cycles | 220/220 steps, 0 skips, 0 rejected; decryptions **405 + 393** (85 + 105 in cycle 1), equal to the model's prediction |
+  | fms, 2 nodes, reduced, 5 cycles | unchanged: 100 + 397, fingerprint `c6a8a0da` |
+  | fake report of `12` at step 0 (`DES_INJECT_EVENT`) | full local modular: **REJECTED**; reduced: **ACCEPTED** |
+  | trace edited so that `12` comes before `11` | node 1: `IMPOSSIBLE`, `SKIP`; the steps that depended on it are skipped too |
+  | extended_small_factory, full local modular, lockstep + monolithic cross-check | PASS |
+
+* **Two ESP32-S3 boards, fms, full local modular, 5 cycles** (the sketch's
+  setting since the plant check). All 220 steps, 0 skipped, 0 retransmissions,
+  0 reports rejected by the plant check, oracle PASS on both, no halt.
+  Decryptions **405 + 393** (85 + 105 in cycle 1, then 80 + 72 per cycle), equal
+  to the model's prediction made before the run. Counting each trace step once
+  (a local step at the node that fires it, a shared step at the slower node), a
+  step takes **308 ms** in cycle 1 and **207 ms** on average over the five
+  cycles, against 273 and 160 ms with the reduced family: the full plant check
+  costs about 30 % per step. The load is balanced (node 1 waited 14.1 s for node
+  2 to reach shared steps, against 25.4 s with the reduced family). Protocol time
+  per controllable shared event: median 14.6 ms against a 13.2 ms mean round
+  trip; three delays of 0.16–0.69 s in the last cycle, with no loss and no
+  retransmission, raised the mean to 44.6 ms.
+
+  | fms, two ESP32-S3, 5 cycles | reduced | full local modular |
+  |---|---|---|
+  | encrypted cells, node 1 / node 2 | 11 / 26 | 75 / 252 |
+  | decryptions, node 1 / node 2 | 100 / 397 | 405 / 393 |
+  | time per trace step, cycle 1 / 5-cycle mean | 273 / 160 ms | 308 / 207 ms |
+  | initial enablement of `12` ("C1 finished") on node 1 | **1** — would accept it | **0** — rejects it |
 * **Not exercised:** more than two physical boards. The flood above was absorbed
   by a PC; an ESP32 spends ~100 µs checking each tag, so ~10 000 frames/s would
   take its whole CPU — authentication stops forgery, not denial of service.
