@@ -368,26 +368,40 @@ same `secrets.h`. To run several nodes on **one** host, add `-DDES_MCAST_LOOP=1`
   | trace edited so that `12` comes before `11` | node 1: `IMPOSSIBLE`, `SKIP`; the steps that depended on it are skipped too |
   | extended_small_factory, full local modular, lockstep + monolithic cross-check | PASS |
 
-* **Two ESP32-S3 boards, fms, full local modular, 5 cycles** (the sketch's
-  setting since the plant check). All 220 steps, 0 skipped, 0 retransmissions,
-  0 reports rejected by the plant check, oracle PASS on both, no halt.
-  Decryptions **405 + 393** (85 + 105 in cycle 1, then 80 + 72 per cycle), equal
-  to the model's prediction made before the run. Counting each trace step once
-  (a local step at the node that fires it, a shared step at the slower node), a
-  step takes **308 ms** in cycle 1 and **207 ms** on average over the five
-  cycles, against 273 and 160 ms with the reduced family: the full plant check
-  costs about 30 % per step. The load is balanced (node 1 waited 14.1 s for node
-  2 to reach shared steps, against 25.4 s with the reduced family). Protocol time
-  per controllable shared event: median 14.6 ms against a 13.2 ms mean round
-  trip; three delays of 0.16–0.69 s in the last cycle, with no loss and no
-  retransmission, raised the mean to 44.6 ms.
+* **Two ESP32-S3 boards, fms, full local modular, 5 cycles, run twice** (the
+  sketch's setting since the plant check). Both runs: all 220 steps, 0 skipped,
+  0 retransmissions, 0 reports rejected by the plant check, oracle PASS on both,
+  no halt. Decryptions **405 + 393** (85 + 105 in cycle 1, then 80 + 72 per
+  cycle) in both, equal to the model's prediction made before the first; the
+  time per step differs by 0.1 % between them. Protocol time per controllable
+  shared event, second run: median 17.8 ms against an 18.2 ms mean round trip.
+  The first run saw three Wi-Fi delays of 0.16–0.69 s in its last cycle, with no
+  loss and no retransmission (mean 44.6 ms, median 14.6 ms); the second did not.
 
-  | fms, two ESP32-S3, 5 cycles | reduced | full local modular |
+  **How to count time when the nodes run in parallel.** Two measures bound it.
+  *Latency*: count each trace step once — a local step at the node that fires
+  it, a shared step at the slower node — and average; that is the time until
+  the step is decided everywhere, what the single-board sketch reports per
+  step. *Bound*: the busier node's total time divided by the steps, i.e. what
+  perfect overlap of the two nodes' work would give. The true time per step
+  lies between them. A node's own `all events` average is neither: it leaves
+  out the other node's local events, its longer applies, and the waits.
+
+  | fms, two ESP32-S3, 5 cycles | reduced | full local modular (2nd run) |
   |---|---|---|
   | encrypted cells, node 1 / node 2 | 11 / 26 | 75 / 252 |
   | decryptions, node 1 / node 2 | 100 / 397 | 405 / 393 |
-  | time per trace step, cycle 1 / 5-cycle mean | 273 / 160 ms | 308 / 207 ms |
+  | per step, cycle 1: latency / bound | 273 / 259 ms | 308 / 266 ms |
+  | per step, 5 cycles: latency / bound | 160 / 146 ms | 207 / 154 ms |
+  | one board, cycle 1 (single-board sketch) | 233.9 ms (both cores) | 335.4 ms |
   | initial enablement of `12` ("C1 finished") on node 1 | **1** — would accept it | **0** — rejects it |
+
+  With the full family, two boards are **8–21 % faster per step** than one in
+  cycle 1 (266–308 against 335.4 ms), because the work is balanced (405 against
+  393 decryptions). With the reduced family they are not (259–273 against 233.9
+  ms): node 2 does 80 % of the decryptions, and that single-board run used both
+  cores. The plant check of the full family costs 13–29 % more latency than the
+  reduced one, but only 3–5 % at the bound.
 * **Not exercised:** more than two physical boards. The flood above was absorbed
   by a PC; an ESP32 spends ~100 µs checking each tag, so ~10 000 frames/s would
   take its whole CPU — authentication stops forgery, not denial of service.
