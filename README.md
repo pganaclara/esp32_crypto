@@ -161,7 +161,8 @@ Protocol, transport analysis and the two-board results:
 ## Benchmark results
 
 Single board, **ESP32-S3** @ 240 MHz, Arduino core 3.3.12 for `fms` (3.3.8 for
-the two small factories), secp192r1, scalar blinding on. All nine runs `PASS`: every homomorphic enablement vector matched the
+the two small factories), secp192r1, scalar blinding on, fast mode
+(`SECURE_MODE 0`; the sketch ships with 1, see [Security notes](#security-notes)). All nine runs `PASS`: every homomorphic enablement vector matched the
 cleartext oracle at every step. Measured `scalar_mul` = 69 ms, `muladd` = 5 ms.
 
 | problem | family | sups | ciphertext | warm-up | avg/step | min | max | decryptions |
@@ -201,13 +202,26 @@ entropy); the firmware is research-grade.
 | # | channel | status | if exploited |
 |---|---|---|---|
 | 1 | Timing / power on the private scalar | **Closed** — every scalar mul is blinded | private-key recovery |
-| 2 | Inactive cells are byte-identical to the global `Enc(0)` | Open | reveals the active state after each transition |
-| 3 | The active cell's bytes are copied unchanged | Open | fingerprints the state trajectory |
+| 2 | Inactive cells are byte-identical to the global `Enc(0)` | **Closed** by `SECURE_MODE 1`; open in fast mode | reveals the active state after each transition |
+| 3 | The active cell's bytes are copied unchanged | **Closed** by `SECURE_MODE 1`; open in fast mode | fingerprints the state trajectory |
 
-Channels 2 and 3 need RAM access and are the price of optimisation 3: the skip is
-fast *because* inactive cells equal `g_zero`. Closing them means re-randomising
-every cell after every transition, about two scalar multiplications per cell —
-tens of seconds per `fms` step. Not implemented.
+Channels 2 and 3 need RAM access and are the price of optimisations 3 and 6: they
+are fast *because* inactive cells equal `g_zero`. `SECURE_MODE 1`, the sketch's
+default, closes them: after every transition each cell of the supervisor that
+moved gets a fresh encryption of zero, so a memory snapshot no longer shows the
+state (a process reading memory continuously could still see the randomness).
+Measured on `fms`, core 3.3.12, oracle `PASS`:
+
+| `fms` | fast mode | secure mode | secure, Enc(0) precomputed |
+|---|---|---|---|
+| local modular | 346.0 ms, 190 dec. | 27.5 s, 553 dec. | 1.90 s |
+| reduced | 241.1 ms, 145 dec. | 3.87 s, 481 dec. | 1.10 s |
+
+Generating the encryptions of zero (two scalar multiplications, 140 ms each) is
+93 % and 71 % of the secure time; the last column leaves it out, but one cycle's
+worth for local modular (8 028 of them) exceeds the board's free memory. The
+decryption counts are the static model's predictions. The distributed engine
+has only the fast mode.
 
 In the distributed engine, frames are authenticated but not encrypted: the state
 stays encrypted, but the timing of shared events is visible on the wire.

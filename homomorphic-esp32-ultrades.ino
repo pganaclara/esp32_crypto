@@ -31,10 +31,11 @@
 //   a per-core DRBG callback, closing the timing/power side-channel on the
 //   private key. Measured cost is below 1 % on the ESP32-S3 hardware-MPI path.
 //
-//   Two memory side-channels remain open by design: inactive cells are
-//   byte-identical to the global Enc(0) constant, and the active cell's bytes
-//   are copied unchanged across transitions. Both need RAM read access. See
-//   the security section of README.md.
+//   With SECURE_MODE 0 (fast mode), two memory side-channels remain open by
+//   design: inactive cells are byte-identical to the global Enc(0) constant,
+//   and the active cell's bytes are copied unchanged across transitions. Both
+//   need RAM read access. SECURE_MODE 1, the default here, closes them, at a
+//   cost — see below and the security section of README.md.
 //
 // Tested with Arduino ESP32 core v3.x on ESP32-WROOM-32 and ESP32-S3.
 // =============================================================================
@@ -84,7 +85,7 @@
 #include <freertos/semphr.h>
 #include <vector>
 
-#include "supervisor_data_extended_small_factory.h"
+#include "supervisor_data_fms.h"
 
 // =============================================================================
 // Configuration
@@ -101,6 +102,19 @@
 #define WORKER_PRIO  2                            // above IDLE(0), below system tasks
 
 // ── Security ────────────────────────────────────────────────────────────────
+//
+// SECURE_MODE 0 (fast): inactive cells become the literal Enc(0) and the active
+// cell is copied unchanged. Optimisations 3 and 6 exploit exactly this, and it
+// lets anyone who can read RAM find the active state once the vector contracts.
+// SECURE_MODE 1: after every transition, each cell of the supervisor that moved
+// gets a fresh encryption of zero added, so every cell always carries fresh
+// randomness and the state is hidden (semantic security). Optimisation 3 then
+// never fires, and 6 only merges rows that are identical in the public table.
+// Generating the encryptions of zero is timed apart from adding them: a pool
+// precomputed offline would take the generation out of the step.
+#ifndef SECURE_MODE
+#define SECURE_MODE 1
+#endif
 //
 // Scalar blinding on decrypt is always on. mbedtls_ecp_mul is called with a
 // DRBG callback so the timing/power profile of the scalar mul does not leak
@@ -166,6 +180,9 @@ static Ciphertext               g_zero;                 // canonical Enc(0) lite
 static bool                     g_dual_core = false;
 static int                      g_step_decrypts = 0;
 static portMUX_TYPE             g_dec_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint64_t                 g_gen_us  = 0;           // SECURE_MODE: generating Enc(0)
+static uint64_t                 g_add_us  = 0;           // SECURE_MODE: adding them in
+static uint32_t                 g_rr_cells = 0;          // SECURE_MODE: cells re-randomized
 
 // IPC for the persistent worker on core 0
 static WorkerCmd          g_wcmd;
@@ -440,6 +457,46 @@ static void do_transition(Supervisor& sv, int ev_gi, int n) {
     sv.dec_c2 = std::move(nxt_c2);
 }
 
+#if SECURE_MODE
+// Add a fresh encryption of zero, (rG, rY), to every cell of sv. The plaintexts
+// do not change; every cell gets new randomness. A cell the transition set to
+// the literal Enc(0) has the point at infinity as its decompressed mirror, which
+// mbedTLS refuses to add, so it simply becomes (rG, rY). Returns an mbedTLS
+// error code; a failure is reported, never skipped silently.
+static int rerandomize(Supervisor& sv, int n) {
+    mbedtls_mpi r;
+    mbedtls_ecp_point z1, z2, s;
+    mbedtls_mpi_init(&r);
+    mbedtls_ecp_point_init(&z1); mbedtls_ecp_point_init(&z2); mbedtls_ecp_point_init(&s);
+    int ret = 0;
+    for (int i = 0; i < n && ret == 0; ++i) {
+        yield();
+        uint64_t t0 = (uint64_t)esp_timer_get_time();
+        ret = mbedtls_ecp_gen_privkey(&g_grp, &r, mbedtls_ctr_drbg_random, &g_drbg);
+        if (ret == 0) ret = mbedtls_ecp_mul(&g_grp, &z1, &r, &g_G,   mbedtls_ctr_drbg_random, &g_drbg);
+        if (ret == 0) ret = mbedtls_ecp_mul(&g_grp, &z2, &r, &g_pub, mbedtls_ctr_drbg_random, &g_drbg);
+        uint64_t t1 = (uint64_t)esp_timer_get_time();
+        if (ret) break;
+        if (mbedtls_ecp_is_zero(&sv.dec_c1[i])) {
+            ret = mbedtls_ecp_copy(&sv.dec_c1[i], &z1);
+            if (ret == 0) ret = mbedtls_ecp_copy(&sv.dec_c2[i], &z2);
+        } else {
+            ret = pt_add(&s, &sv.dec_c1[i], &z1);
+            if (ret == 0) { swap_pt(&sv.dec_c1[i], &s); ret = pt_add(&s, &sv.dec_c2[i], &z2); }
+            if (ret == 0) swap_pt(&sv.dec_c2[i], &s);
+        }
+        if (ret == 0) ret = pt_compress(&sv.dec_c1[i], sv.enc[i].c1);
+        if (ret == 0) ret = pt_compress(&sv.dec_c2[i], sv.enc[i].c2);
+        g_gen_us += t1 - t0;
+        g_add_us += (uint64_t)esp_timer_get_time() - t1;
+        if (ret == 0) ++g_rr_cells;
+    }
+    mbedtls_mpi_free(&r);
+    mbedtls_ecp_point_free(&z1); mbedtls_ecp_point_free(&z2); mbedtls_ecp_point_free(&s);
+    return ret;
+}
+#endif
+
 // =============================================================================
 // Parallel decrypt engine
 // =============================================================================
@@ -461,7 +518,7 @@ static void process_work_range(int start, int end,
         int n  = (int)pgm_read_word(&sv.desc->num_states);
         int gi = sv.constrained_gi[w.li];
 
-        int e; bool did_decrypt;
+        int e = 0; bool did_decrypt = false;
         if (row_decrypt(sv, sv.desc->enable + gi * n, n, &e, &did_decrypt) != 0) continue;
         if (did_decrypt) (*dec_count)++;
         // Result goes to the unit, not straight to a row: he_step fans it out
@@ -546,6 +603,9 @@ static int he_step(int ev_gi, std::vector<int>& en_out) {
         if (!(sv.trans_event_mask & (1u << ev_gi))) continue;     // cached values still valid
         int n = (int)pgm_read_word(&sv.desc->num_states);
         do_transition(sv, ev_gi, n);
+#if SECURE_MODE
+        if (int err = rerandomize(sv, n)) return err;
+#endif
 
         queued.clear();
         for (uint8_t li : sv.changes_if_zero[ev_gi])
@@ -885,6 +945,7 @@ static void run_benchmark(const char* label, const SupDesc* descs, int count) {
     Oracle oracle; oracle.init(descs, count);
     uint64_t total_us = 0, min_us = UINT64_MAX, max_us = 0;
     int  total_dec = 0;
+    g_gen_us = g_add_us = 0; g_rr_cells = 0;
     bool all_ok    = true;
 
     for (int step = 0; step < SIM_SEQ_LEN; ++step) {
@@ -897,6 +958,7 @@ static void run_benchmark(const char* label, const SupDesc* descs, int count) {
         std::vector<int> oracle_en = oracle.step(ev_gi, descs, count);
         std::vector<int> he_en;
         g_step_decrypts = 0;
+        uint64_t gen0 = g_gen_us, add0 = g_add_us;
         uint64_t t0      = (uint64_t)esp_timer_get_time();
         int      ret     = he_step(ev_gi, he_en);
         uint64_t step_us = (uint64_t)esp_timer_get_time() - t0;
@@ -911,8 +973,12 @@ static void run_benchmark(const char* label, const SupDesc* descs, int count) {
         if (!ok) all_ok = false;
         Serial.print("  [Oracle] "); print_vec(oracle_en); Serial.println();
         Serial.print("  [HE]     "); print_vec(he_en);     Serial.println();
-        Serial.printf("  Time: %.3f ms  |  Decrypts: %d  |  %s\n\n",
+        Serial.printf("  Time: %.3f ms  |  Decrypts: %d  |  %s\n",
                       step_us / 1000.0, g_step_decrypts, ok ? "OK" : "FAIL");
+        if (SECURE_MODE)
+            Serial.printf("  Re-randomization: generating Enc(0) %.3f ms, adding %.3f ms\n",
+                          (g_gen_us - gen0) / 1000.0, (g_add_us - add0) / 1000.0);
+        Serial.println();
     }
 
     int ns = SIM_SEQ_LEN ? SIM_SEQ_LEN : 1;
@@ -922,6 +988,15 @@ static void run_benchmark(const char* label, const SupDesc* descs, int count) {
                   min_us / 1000.0, max_us / 1000.0);
     Serial.printf("  Total decrypts: %d | Supervisors: %d | Result: %s\n",
                   total_dec, count, all_ok ? "PASS" : "FAIL");
+    if (SECURE_MODE) {
+        Serial.printf("  Secure mode: %u cells re-randomized; generating Enc(0) %.3f ms "
+                      "(%.3f ms each), adding %.3f ms\n", (unsigned)g_rr_cells,
+                      g_gen_us / 1000.0, g_rr_cells ? g_gen_us / 1000.0 / g_rr_cells : 0.0,
+                      g_add_us / 1000.0);
+        Serial.printf("  With Enc(0) precomputed offline: Total %.3f ms | Avg %.3f ms\n",
+                      (total_us - g_gen_us) / 1000.0,
+                      ((total_us - g_gen_us) / (double)ns) / 1000.0);
+    }
     Serial.println("============================================\n");
 
     for (auto& sv : g_sups) { sv_free_dec(sv); sv.enc.clear(); }
@@ -1011,7 +1086,8 @@ void setup() {
     Serial.printf("  EVENT_COUNT : %d\n",      EVENT_COUNT);
     Serial.printf("  SIM_SEQ_LEN : %d\n",      SIM_SEQ_LEN);
     Serial.printf("  Ciphertext  : %u bytes\n", (unsigned)sizeof(Ciphertext));
-    Serial.printf("  Security    : scalar blinding\n\n");
+    Serial.printf("  Security    : scalar blinding, %s mode\n\n",
+                  SECURE_MODE ? "SECURE (fresh randomness in every cell)" : "fast");
 
     crypto_init();
 
