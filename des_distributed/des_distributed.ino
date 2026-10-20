@@ -60,7 +60,9 @@
 #define DES_MCAST_PORT  5077
 
 // ── 4. experiment knobs ─────────────────────────────────────────────────────
-#define DES_ROUNDS            5     // production cycles
+#define DES_ROUNDS            1     // production cycles; with every cell
+                                    //     re-randomized, one fms local-modular
+                                    //     cycle takes ~15 min on two ESP32-S3
 #define DES_WORK_MS           0     // simulated machine processing time;
                                     //     0 = cryptography and protocol alone,
                                     //     to compare with the single-board sketch
@@ -69,7 +71,7 @@
 #define DES_BENCH_LOCKSTEP    0     // 0 = each node walks freely and waits only
                                     //     on SHARED events. Recommended, and
                                     //     required for fms on 2 boards: one
-                                    //     node owes 3-4 s per shared apply, so
+                                    //     node owes up to ~35 s per shared apply, so
                                     //     the nodes cannot stay in step.
                                     // 1 = every node replays the whole trace
                                     //     (announces local events too), giving

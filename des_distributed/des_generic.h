@@ -60,6 +60,13 @@
 // physically impossible — a sensor fault or a forged report — and is rejected
 // rather than applied. Only supervisors synthesised over the plant (full local
 // modular, monolithic) catch every such event; a reduced one may allow it.
+//
+// Privacy: after every event a node applies, every cell of its supervisors that
+// move gets a fresh encryption of zero, and a node keeps no decision — it
+// computes the one it needs (to fire, to vote, to check a reported event) from
+// the encrypted state, when it needs it. A memory snapshot of a node shows
+// neither its supervisors' state nor their decisions. Its private key is on the
+// same node; des_split/ is the version that keeps the key on the plant's board.
 // =============================================================================
 
 #pragma once
@@ -105,9 +112,12 @@
 // machine 1" five times in a row. Generating plausible traces needs the plant
 // model, which the generated header does not carry.
 
-// How long to wait for one SIM_SEQ step before declaring it inadmissible.
+// How long to wait for one SIM_SEQ step before declaring it inadmissible. A
+// peer applying an event re-randomizes every cell of its supervisors that move
+// — up to ~35 s on the node holding S4–S6 of the fms local-modular family — so
+// this covers several of its steps.
 #ifndef DES_STEP_TIMEOUT_MS
-#define DES_STEP_TIMEOUT_MS 10000
+#define DES_STEP_TIMEOUT_MS 120000
 #endif
 
 #ifndef DES_ROUNDS
@@ -118,11 +128,12 @@
 #endif
 
 // ── transaction tuning ──────────────────────────────────────────────────────
-// timeout × retries must cover the longest homomorphic step any participant
-// can be in when a request arrives: frames keep being RECEIVED during a step
-// (he_yield), but they are only ACTED ON when it ends, and one step was
-// measured at 3-4 s on `fms`. 1.5 s × 4 tries = 6 s. At 250 ms the initiator
-// gave up on commits the peer was about to accept perfectly well.
+// Frames keep being RECEIVED during a homomorphic step (he_yield), but they
+// are only ACTED ON when it ends, and with every cell re-randomized one step
+// takes up to ~35 s on `fms` local modular. A request that times out is
+// harmless — nothing was applied, and the driver asks again until
+// DES_STEP_TIMEOUT_MS. An acknowledgement that times out halts the cell, so
+// ACK timeout × retries must cover the longest step: 1.5 s × 40 = 60 s.
 #ifndef DES_REQ_TIMEOUT_MS
 #define DES_REQ_TIMEOUT_MS 1500
 #endif
@@ -133,7 +144,7 @@
 #define DES_REQ_RETRIES 4             // failure here is harmless — nothing applied
 #endif
 #ifndef DES_ACK_RETRIES
-#define DES_ACK_RETRIES 5             // failure here forces a SAFE HALT
+#define DES_ACK_RETRIES 40            // failure here forces a SAFE HALT
 #endif
 #ifndef DES_LOCK_TIMEOUT_MS
 #define DES_LOCK_TIMEOUT_MS 2000      // frees a lock held by a dead initiator
@@ -310,12 +321,8 @@ struct Supervisor {
     const SupDesc* desc;
     int            global_index = -1;
     uint32_t       trans_event_mask = 0;
-    std::vector<uint8_t>              constrained_gi;
     std::vector<Ciphertext>           enc;
     std::vector<mbedtls_ecp_point>    dec_c1, dec_c2;
-    std::vector<int8_t>               cached_en;
-    std::vector<std::vector<uint8_t>> changes_if_zero;
-    std::vector<std::vector<uint8_t>> changes_if_one;
 };
 
 // =============================================================================
@@ -326,7 +333,8 @@ struct Supervisor {
 
 // Bumped whenever the wire format or its meaning changes; part of the config
 // fingerprint, so boards flashed from different versions refuse each other.
-#define DES_PROTO_VERSION 6
+// 7: fresh randomness in every cell, decisions computed on demand, not kept.
+#define DES_PROTO_VERSION 7
 
 enum : uint8_t {
     M_HELLO = 1, M_REQ, M_VOTE, M_COMMIT, M_NOTIFY,
@@ -392,7 +400,6 @@ static mbedtls_ecp_point        g_G, g_pub;
 static mbedtls_mpi              g_priv, g_one, g_neg_priv;
 static mbedtls_ctr_drbg_context g_drbg;
 static mbedtls_entropy_context  g_entropy;
-static Ciphertext               g_zero;
 
 // Per-event routing, derived at boot from EVERY supervisor descriptor.
 struct EvRoute {
@@ -523,7 +530,14 @@ static uint32_t g_await_seq  = 0, g_await_need = 0, g_await_got = 0;
 static bool     g_await_no   = false;
 
 static uint32_t g_tx = 0, g_rx = 0, g_retx = 0;
-static int      g_step_decrypts = 0;
+static int      g_step_decrypts = 0;     // decryptions of the last verdict computed
+static int      g_step_cells = 0;        // cells re-randomized by the last step
+static uint64_t g_dec_total = 0, g_cells_total = 0, g_gen_us = 0;
+// Bumped by every homomorphic step. A verdict computed at an older version may
+// be stale; one computed at the current version is still right.
+static uint32_t g_state_ver = 0;
+static uint32_t g_vote_ver = 0;          // state version of my last YES vote...
+static int      g_vote_ev  = -1;         // ...and its event
 
 struct Acc {
     uint32_t n = 0;
@@ -543,11 +557,11 @@ static uint32_t g_sync_n  = 0;
 // 6b. Deferred receive queue — why a node must never stop reading the socket
 // =============================================================================
 //
-// A homomorphic step is not fast. On an ESP32-S3 one scalar multiplication on
-// secp192r1 costs ~69 ms, and a step owes one per DISTINCT row sum it must
-// re-evaluate (row_decrypt sums the row first, then does a single blinded
-// multiplication; see he_step). Before rows were shared this was measured at
-// 32-47 multiplications, 3-4 s, for one `fms` event on the node holding S4-S6.
+// A homomorphic step is not fast. On an ESP32-S3 every cell of a supervisor
+// that moves gets a fresh encryption of zero, two scalar multiplications on
+// secp192r1 (~140 ms), so the node holding S4-S6 of the `fms` local-modular
+// family spends up to ~35 s on one event; a decision costs one more scalar
+// multiplication (~69 ms) per supervisor that constrains the event.
 //
 // lwIP's UDP receive mailbox holds CONFIG_LWIP_UDP_RECVMBOX_SIZE datagrams —
 // 6 by default, and an Arduino build links precompiled ESP-IDF libraries and
@@ -559,14 +573,14 @@ static uint32_t g_sync_n  = 0;
 // the same as acting on what arrives: M_COMMIT calls he_step(), so handling a
 // frame from inside he_step() would re-enter it and mutate `g_sups` under the
 // outer call's own references — and answering M_REQ mid-step would vote on a
-// `cached_en` array that is neither the pre-event nor the post-event state.
+// state that is neither the pre-event nor the post-event one.
 //
 // So reading and dispatching are split. he_yield() only moves datagrams from
 // the kernel into this queue, touching no supervisor state and sending
 // nothing; pump() dispatches, and refuses to while a step is in flight. The
 // queue is the buffer lwIP will not give us.
 #ifndef DES_RXQ_LEN
-#define DES_RXQ_LEN 64
+#define DES_RXQ_LEN 256              // frames that arrive during a long step
 #endif
 static DesFrame g_rxq[DES_RXQ_LEN];
 static uint16_t g_rxq_head = 0, g_rxq_tail = 0;
@@ -678,9 +692,6 @@ static inline int8_t   pm_i8 (const int8_t*   a, int i) { return (int8_t) pgm_re
 static inline int16_t  pm_i16(const int16_t*  a, int i) { return (int16_t)pgm_read_word(a+i); }
 static inline uint16_t pm_u16(const uint16_t* a, int i) { return (uint16_t)pgm_read_word(a+i); }
 
-static inline bool is_g_zero(const Ciphertext& c) {
-    return memcmp(&c, &g_zero, sizeof(Ciphertext)) == 0;
-}
 static int trans_offset(const SupDesc* d, int ev) {
     int off = 0; for (int i = 0; i < ev; ++i) off += (int)pm_u16(d->tcnt, i); return off;
 }
@@ -777,16 +788,15 @@ done:
     return ret;
 }
 
-// Fused homomorphic row-sum + blinded decrypt.
+// Homomorphic sum of EVERY enabled cell of the row, whatever it encrypts, then
+// a blinded decryption of the sum. *did is false for a row with no enabled
+// state, which is decided from the table.
 static int row_decrypt(const Supervisor& sv, const int8_t* row, int n,
                        int* out, bool* did) {
     *did = false;
     int first = -1;
-    for (int i = 0; i < n; ++i) {
-        if (!pm_i8(row, i))       continue;
-        if (is_g_zero(sv.enc[i])) continue;
-        first = i; break;
-    }
+    for (int i = 0; i < n; ++i)
+        if (pm_i8(row, i)) { first = i; break; }
     if (first < 0) { *out = 0; return 0; }
 
     mbedtls_ecp_point s1, s2, tmp;
@@ -795,7 +805,6 @@ static int row_decrypt(const Supervisor& sv, const int8_t* row, int n,
     ret     = mbedtls_ecp_copy(&s2, &sv.dec_c2[first]); if (ret) goto done;
     for (int i = first + 1; i < n; ++i) {
         if (!pm_i8(row, i))       continue;
-        if (is_g_zero(sv.enc[i])) continue;
         ret = mbedtls_ecp_muladd(&g_grp, &tmp, &g_one, &s1, &g_one, &sv.dec_c1[i]); if (ret) goto done;
         swap_pt(&s1, &tmp);
         ret = mbedtls_ecp_muladd(&g_grp, &tmp, &g_one, &s2, &g_one, &sv.dec_c2[i]); if (ret) goto done;
@@ -822,7 +831,8 @@ done:
 static void do_transition(Supervisor& sv, int ev, int n) {
     int      off = trans_offset(sv.desc, ev);
     uint16_t pc  = pm_u16(sv.desc->tcnt, ev);
-    std::vector<Ciphertext>        nxt(n, g_zero);
+    std::vector<Ciphertext>        nxt(n);
+    std::vector<uint8_t>           filled(n, 0);
     std::vector<mbedtls_ecp_point> n1(n), n2(n);
     for (int i = 0; i < n; ++i) { mbedtls_ecp_point_init(&n1[i]); mbedtls_ecp_point_init(&n2[i]); }
     // The image of a state set under an event is a UNION, not an assignment.
@@ -830,19 +840,15 @@ static void do_transition(Supervisor& sv, int ev, int n) {
     // collisions in its reduced supervisors), and writing `nxt[t] = enc[f]`
     // unconditionally lets whichever pair happens to come last win — so an
     // INACTIVE source silently overwrites an ACTIVE one, and the result depends
-    // on the order the generator happened to emit the pairs in.
-    //
-    // Skipping zero sources makes the common path both correct and unchanged in
-    // cost: a cell holding the literal Enc(0) contributes nothing to a union, so
-    // it can never clobber an active cell. If two ACTIVE sources ever converge
-    // (impossible for a one-hot state, but not something to assume), they are
-    // combined with the additive homomorphism, which is exactly the OR this
-    // encoding uses everywhere else.
+    // on the order the generator happened to emit the pairs in. Converging
+    // sources are combined with the additive homomorphism, which is exactly
+    // the OR this encoding uses everywhere else. A target no source reaches
+    // stays empty (the point at infinity) until rerandomize() fills it.
     for (uint16_t p = 0; p < pc; ++p) {
         int f = pm_i16(sv.desc->trans + off*2, p*2);
         int t = pm_i16(sv.desc->trans + off*2, p*2+1);
-        if (is_g_zero(sv.enc[f])) continue;              // contributes nothing
-        if (is_g_zero(nxt[t])) {
+        if (!filled[t]) {
+            filled[t] = 1;
             nxt[t] = sv.enc[f];
             mbedtls_ecp_copy(&n1[t], &sv.dec_c1[f]);
             mbedtls_ecp_copy(&n2[t], &sv.dec_c2[f]);
@@ -863,92 +869,69 @@ static void do_transition(Supervisor& sv, int ev, int n) {
     sv.enc = std::move(nxt); sv.dec_c1 = std::move(n1); sv.dec_c2 = std::move(n2);
 }
 
-// Apply an event to every local supervisor that transitions on it, refreshing
-// the enablement bits that could have flipped. Returns microseconds spent.
+// Add a fresh encryption of zero, (rG, rY), to every cell of sv: the bits do
+// not change, the randomness of every cell does, so no cell can be recognised
+// or followed from one step to the next. A cell the transition left empty has
+// the point at infinity in the cache, which mbedTLS refuses to add, so it
+// simply becomes (rG, rY).
+static int rerandomize(Supervisor& sv, int n) {
+    mbedtls_mpi r; mbedtls_ecp_point z1, z2, s;
+    mbedtls_mpi_init(&r);
+    mbedtls_ecp_point_init(&z1); mbedtls_ecp_point_init(&z2); mbedtls_ecp_point_init(&s);
+    int ret = 0;
+    for (int i = 0; i < n && ret == 0; ++i) {
+        he_yield();                              // ~140 ms a cell: keep the socket clear
+        uint64_t t0 = des_micros();
+        ret = mbedtls_ecp_gen_privkey(&g_grp, &r, mbedtls_ctr_drbg_random, &g_drbg);
+        if (ret == 0) ret = mbedtls_ecp_mul(&g_grp, &z1, &r, &g_G,   mbedtls_ctr_drbg_random, &g_drbg);
+        if (ret == 0) ret = mbedtls_ecp_mul(&g_grp, &z2, &r, &g_pub, mbedtls_ctr_drbg_random, &g_drbg);
+        g_gen_us += des_micros() - t0;
+        if (ret) break;
+        if (mbedtls_ecp_is_zero(&sv.dec_c1[i])) {
+            ret = mbedtls_ecp_copy(&sv.dec_c1[i], &z1);
+            if (ret == 0) ret = mbedtls_ecp_copy(&sv.dec_c2[i], &z2);
+        } else {
+            ret = pt_add(&s, &sv.dec_c1[i], &z1);
+            if (ret == 0) { swap_pt(&sv.dec_c1[i], &s); ret = pt_add(&s, &sv.dec_c2[i], &z2); }
+            if (ret == 0) swap_pt(&sv.dec_c2[i], &s);
+        }
+        if (ret == 0) ret = pt_compress(&sv.dec_c1[i], sv.enc[i].c1);
+        if (ret == 0) ret = pt_compress(&sv.dec_c2[i], sv.enc[i].c2);
+        if (ret == 0) { ++g_step_cells; ++g_cells_total; }
+    }
+    mbedtls_mpi_free(&r);
+    mbedtls_ecp_point_free(&z1); mbedtls_ecp_point_free(&z2); mbedtls_ecp_point_free(&s);
+    return ret;
+}
+
+static void safe_halt(const char* why);     // section 12
+
+// Apply an event to every local supervisor that transitions on it: move the
+// cells, then give every cell of those supervisors a fresh encryption of zero.
+// No decision is computed here: local_enabled() computes one when it is
+// needed. Returns microseconds spent.
 static uint64_t he_step(int ev) {
     uint64_t t0 = des_micros();
-    g_step_decrypts = 0;
+    g_step_cells = 0;
     // Hold off frame DISPATCH for the duration — a COMMIT handled here would
     // re-enter this function and mutate `g_sups` under our own references, and
-    // an M_REQ would be answered from a half-updated `cached_en`. Reading the
-    // socket continues throughout (he_yield below); only acting on it waits.
+    // an M_REQ would be judged on a half-updated state. Reading the socket
+    // continues throughout (he_yield); only acting on it waits.
     g_in_he = true;
-    static std::vector<uint8_t>  queued;   // rows whose cached bit could flip
-    static std::vector<uint8_t>  unit_of;  // queued[k] -> index into reps
-    static std::vector<uint8_t>  reps;     // one representative row per distinct sum
-    static std::vector<int8_t>   outs;
-    static std::vector<uint16_t> nz;       // cells that are not the g_zero literal
     for (auto& sv : g_sups) {
         if (!(sv.trans_event_mask & (1u << ev))) continue;
         int n = (int)pgm_read_word(&sv.desc->num_states);
         he_yield();
         do_transition(sv, ev, n);
-
-        // (1) The work list is built from the cached bits as they stood BEFORE
-        // this step, and nothing is decrypted until it is complete. A row can
-        // sit in both flip lists; decrypting as the lists were walked let the
-        // first pass flip it 0->1, after which the second pass saw a 1 and
-        // decrypted the very same row again. Same answer, a wasted 69 ms scalar
-        // multiplication — measured on two ESP32-S3 as exactly twice the
-        // necessary work on node 1 (420 decryptions where 210 were needed).
-        // The single-board sketch was corrected long ago; this is the same fix.
-        queued.clear();
-        for (uint8_t li : sv.changes_if_zero[ev]) if (sv.cached_en[li] == 0) queued.push_back(li);
-        for (uint8_t li : sv.changes_if_one[ev])  if (sv.cached_en[li] == 1) queued.push_back(li);
-        if (queued.empty()) continue;
-
-        // (2) OPTIMISATION 6 — share identical row sums, as in the single-board
-        // sketch. row_decrypt sums the cells of a row that are not the literal
-        // g_zero, so a row's homomorphic sum is fixed by WHICH NON-ZERO CELLS
-        // it covers, not by the row itself. Once the non-zero set has
-        // contracted to the active cell, every row covering that cell has the
-        // same sum; decrypt each distinct sum once and fan the bit out. Nothing
-        // new is revealed: this reuses a value the code already computes, via
-        // the is_g_zero test row_decrypt already performs. Predicted from the
-        // hardware log with a ciphertext-level model that reproduces every
-        // decryption count in it: 3924 -> 397 decryptions for node 2 over five
-        // fms cycles, and 145 in cycle 1 across both nodes — exactly the
-        // single-board figure, as it must be for the same work split two ways.
-        nz.clear();
-        for (int s = 0; s < n; ++s) if (!is_g_zero(sv.enc[s])) nz.push_back((uint16_t)s);
-        reps.clear(); unit_of.clear();
-        for (uint8_t li : queued) {
-            const int8_t* row = sv.desc->enable + sv.constrained_gi[li] * n;
-            size_t u = 0;
-            for (; u < reps.size(); ++u) {
-                const int8_t* other = sv.desc->enable + sv.constrained_gi[reps[u]] * n;
-                bool same = true;
-                for (uint16_t c : nz)
-                    if ((pm_i8(row, c) != 0) != (pm_i8(other, c) != 0)) { same = false; break; }
-                if (same) break;
-            }
-            if (u == reps.size()) reps.push_back(li);
-            unit_of.push_back((uint8_t)u);
+        if (rerandomize(sv, n) != 0) {
+            g_in_he = false;
+            safe_halt("re-randomization failed");
+            return des_micros() - t0;
         }
-        outs.assign(reps.size(), -1);
-        for (size_t u = 0; u < reps.size(); ++u) {
-            int e; bool dd;
-            he_yield();
-            if (row_decrypt(sv, sv.desc->enable + sv.constrained_gi[reps[u]] * n, n,
-                            &e, &dd) == 0) {
-                outs[u] = (int8_t)e; if (dd) ++g_step_decrypts;
-            }
-        }
-        // A unit left at -1 means row_decrypt failed; those rows keep their bit.
-        for (size_t k = 0; k < queued.size(); ++k)
-            if (outs[unit_of[k]] >= 0) sv.cached_en[queued[k]] = outs[unit_of[k]];
     }
+    ++g_state_ver;
     g_in_he = false;
     return des_micros() - t0;
-}
-
-// This node's verdict, from already-decrypted cached bits. Events none of my
-// supervisors constrain are, by definition, allowed by me.
-static bool local_enabled(int gi) {
-    for (auto& sv : g_sups)
-        for (size_t li = 0; li < sv.constrained_gi.size(); ++li)
-            if (sv.constrained_gi[li] == gi && !sv.cached_en[li]) return false;
-    return true;
 }
 
 // =============================================================================
@@ -1079,7 +1062,7 @@ static inline bool i_participate(int gi)    { return (g_route[gi].part_mask & g_
 static inline bool i_am_relevant(int gi)    { return (g_route[gi].node_mask & g_my_node_bit) != 0; }
 
 // =============================================================================
-// 10. Loading, encryption, cache warm-up
+// 10. Loading and encryption
 // =============================================================================
 
 static bool load_my_supervisors() {
@@ -1092,57 +1075,15 @@ static bool load_my_supervisors() {
         sv.global_index = s;
         int n = (int)pgm_read_word(&sv.desc->num_states);
 
+        int rows = 0;
         for (int gi = 0; gi < EVENT_COUNT; ++gi) {
             if (pm_u16(sv.desc->tcnt, gi) > 0) sv.trans_event_mask |= (1u << gi);
-            bool constrains = false;
-            for (int st = 0; st < n && !constrains; ++st)
-                if (!pm_i8(sv.desc->enable, gi*n + st)) constrains = true;
-            if (constrains) sv.constrained_gi.push_back((uint8_t)gi);
-        }
-        sv.cached_en.assign(sv.constrained_gi.size(), 1);
-        sv.changes_if_zero.assign(EVENT_COUNT, {});
-        sv.changes_if_one .assign(EVENT_COUNT, {});
-
-        // Conditional invariance: for each (event, row), can the row's
-        // homomorphic OR-sum actually flip? Rows in neither list keep their
-        // cached value and cost nothing.
-        for (int ev = 0; ev < EVENT_COUNT; ++ev) {
-            uint16_t pc = pm_u16(sv.desc->tcnt, ev);
-            if (!pc) continue;
-            int off = trans_offset(sv.desc, ev);
-            std::vector<uint8_t> in_from(n, 0);
-            std::vector<int16_t> to_of(n, -1);
-            for (int p = 0; p < pc; ++p) {
-                int f = pm_i16(sv.desc->trans + off*2, p*2);
-                int t = pm_i16(sv.desc->trans + off*2, p*2+1);
-                in_from[f] = 1; to_of[f] = (int16_t)t;
-            }
-            for (int li = 0; li < (int)sv.constrained_gi.size(); ++li) {
-                int gi = sv.constrained_gi[li];
-                const int8_t* row = sv.desc->enable + gi*n;
-                bool any = false;
-                for (int st = 0; st < n && !any; ++st) if (pm_i8(row, st)) any = true;
-                if (!any) { sv.cached_en[li] = 0; continue; }
-                bool z2o = false;
-                for (int p = 0; p < pc && !z2o; ++p) {
-                    int f = pm_i16(sv.desc->trans + off*2, p*2);
-                    int t = pm_i16(sv.desc->trans + off*2, p*2+1);
-                    if (!pm_i8(row, f) && pm_i8(row, t)) z2o = true;
-                }
-                if (z2o) sv.changes_if_zero[ev].push_back((uint8_t)li);
-                bool o2z = false;
-                for (int st = 0; st < n && !o2z; ++st) {
-                    if (!pm_i8(row, st)) continue;
-                    if (!in_from[st])             { o2z = true; break; }
-                    if (!pm_i8(row, to_of[st]))   { o2z = true; break; }
-                }
-                if (o2z) sv.changes_if_one[ev].push_back((uint8_t)li);
-            }
+            for (int st = 0; st < n; ++st)
+                if (!pm_i8(sv.desc->enable, gi*n + st)) { ++rows; break; }
         }
         char nm[16];
         DES_LOG("[load] %-10s idx %d  %3d states  %2d constraining ev  %6u B ciphertext\n",
-                sup_name(sv.desc, nm), s, n, (int)sv.constrained_gi.size(),
-                (unsigned)(n * sizeof(Ciphertext)));
+                sup_name(sv.desc, nm), s, n, rows, (unsigned)(n * sizeof(Ciphertext)));
     }
     if (g_sups.empty())
         DES_LOG("[load] WARNING: no supervisor assigned to this node — it will "
@@ -1168,18 +1109,6 @@ static bool init_states() {
     return true;
 }
 
-static void warm_cache() {
-    for (auto& sv : g_sups)
-        for (size_t li = 0; li < sv.constrained_gi.size(); ++li) {
-            int n = (int)pgm_read_word(&sv.desc->num_states);
-            int gi = sv.constrained_gi[li];
-            int e; bool dd;
-            DES_YIELD();
-            if (row_decrypt(sv, sv.desc->enable + gi*n, n, &e, &dd) == 0)
-                sv.cached_en[li] = (int8_t)e;
-        }
-}
-
 static void crypto_init() {
     mbedtls_ecp_group_init(&g_grp);
     mbedtls_ecp_point_init(&g_G); mbedtls_ecp_point_init(&g_pub);
@@ -1196,7 +1125,6 @@ static void crypto_init() {
     // no threshold crypto, no re-encryption.
     mbedtls_ecp_gen_keypair(&g_grp, &g_priv, &g_pub, mbedtls_ctr_drbg_random, &g_drbg);
     mbedtls_mpi_sub_mpi(&g_neg_priv, &g_grp.N, &g_priv);
-    elgamal_enc(0, &g_zero, &g_drbg);
 }
 
 // =============================================================================
@@ -1243,7 +1171,6 @@ struct ClearSup {
 
 static std::vector<ClearSup> g_oracle;      // mirrors MY supervisors
 static bool g_he_mismatch = false;
-static void safe_halt(const char* why);     // section 12
 
 #if DES_VERIFY_MONO && HAS_MONO && DES_BENCH_LOCKSTEP
 static ClearSup g_mono;
@@ -1275,18 +1202,42 @@ static void oracle_step(int gi) {
         return;
     }
 }
-static void oracle_verify(const char* ctx) {
-    for (int gi = 0; gi < EVENT_COUNT; ++gi) {
-        bool he = local_enabled(gi);
-        bool cl = true;
-        for (auto& o : g_oracle) if (!o.enabled(gi)) { cl = false; break; }
-        if (he != cl) {
-            char nm[16];
-            DES_LOG("  [!!] HE/oracle MISMATCH on %s after %s: HE=%d clear=%d\n",
-                    ev_name(gi, nm), ctx, (int)he, (int)cl);
-            g_he_mismatch = true;
+// This node's verdict on event gi, computed now from the encrypted state and
+// not kept: a node stores no decision. One homomorphic sum and one zero test
+// per local supervisor whose row of gi disables it somewhere (a row with no
+// enabled state is decided from the table); an event none of my supervisors
+// constrain is, by definition, allowed by me. Every verdict is checked against
+// the cleartext oracle on the spot. g_verdict_us gets the time it took.
+static uint64_t g_verdict_us = 0;
+static bool local_enabled(int gi) {
+    uint64_t t0 = des_micros();
+    g_step_decrypts = 0;
+    bool ok = true;
+    for (auto& sv : g_sups) {
+        int n = (int)pgm_read_word(&sv.desc->num_states);
+        const int8_t* row = sv.desc->enable + gi * n;
+        bool zero = false, one = false;
+        for (int st = 0; st < n; ++st) (pm_i8(row, st) ? one : zero) = true;
+        if (!zero) continue;                      // never disables gi
+        if (!one) { ok = false; break; }          // disables it everywhere
+        int e = 0; bool did = false;
+        if (row_decrypt(sv, row, n, &e, &did) != 0) {
+            safe_halt("a zero test failed");
+            ok = false; break;
         }
+        if (did) { ++g_step_decrypts; ++g_dec_total; }
+        if (!e) { ok = false; break; }
     }
+    g_verdict_us = des_micros() - t0;
+    bool cl = true;
+    for (auto& o : g_oracle) if (!o.enabled(gi)) { cl = false; break; }
+    if (ok != cl) {
+        char nm[16];
+        DES_LOG("  [!!] HE/oracle MISMATCH on %s: HE=%d clear=%d\n",
+                ev_name(gi, nm), (int)ok, (int)cl);
+        g_he_mismatch = true;
+    }
+    return ok;
 }
 // Safety gate: nothing may fire that the centralised supervisor forbids.
 static void mono_check_and_step(int gi, const char* how) {
@@ -1351,12 +1302,18 @@ static void participant_apply(const DesFrame& f) {
     if (!i_participate(f.ev)) return;
     uint32_t* last = &g_seq_from[f.src];
     if (f.seq <= *last) { tx(M_ACK, f.ev, f.seq); return; }        // duplicate
-    // PLANT CHECK, participant side (see fire()). Only a NOTIFY can get here
-    // disabled: for a COMMIT this node voted yes and has been locked since. An
+    // PLANT CHECK, participant side (see fire()). For a COMMIT this node voted
+    // yes; if it is still locked by the same initiator and its state has not
+    // moved since, the vote holds and there is nothing to recompute. Otherwise
+    // — a NOTIFY, or a state that moved — the verdict is computed now. An
     // uncontrollable event cannot be refused — the owner reports it happened —
     // but applying one our supervisors say no machine could produce would empty
     // their state. The two nodes' models no longer agree, so halt instead.
-    if (!local_enabled(f.ev)) {
+    bool vote_holds = f.type == M_COMMIT && g_lock_by == f.src &&
+                      g_vote_ev == f.ev && g_vote_ver == g_state_ver;
+    int      vdec = 0;
+    uint64_t vus  = 0;
+    if (!vote_holds && !local_enabled(f.ev)) {
         ++g_impossible;
         DES_REACT_TAG();
         DES_LOG("[!!]   %-4s  IMPOSSIBLE — reported by node %d, but no machine could "
@@ -1378,23 +1335,23 @@ static void participant_apply(const DesFrame& f) {
     // applying the event. The ACK therefore means "accepted, and I will apply
     // it", not "already applied" — which is what two-phase commit actually
     // requires of a participant, and is why a real 2PC logs before it votes.
+    if (!vote_holds) { vdec = g_step_decrypts; vus = g_verdict_us; }
     *last = f.seq;
     if (g_lock_by == f.src) g_lock_by = 0;                          // release
     tx(M_ACK, f.ev, f.seq);
 
-    uint64_t he = he_step(f.ev);
+    uint64_t he = he_step(f.ev) + vus;
     oracle_step(f.ev);
     mono_check_and_step(f.ev, "participant");
-    oracle_verify(ev_name(f.ev, nm));
     if (f.occ > g_resolved_occ[f.ev]) g_resolved_occ[f.ev] = f.occ;
     g_acc_part.add(he, 0, he);
     DES_REACT_TAG();
-    DES_LOG("apply  %-4s  %8.1f ms HE  %3d dec  from node %d  (seq %u)\n",
-            ev_name(f.ev, nm), he/1000.0, g_step_decrypts, (int)f.src, (unsigned)f.seq);
+    DES_LOG("apply  %-4s  %8.1f ms HE  %3d dec %4d cells  from node %d  (seq %u)\n",
+            ev_name(f.ev, nm), he/1000.0, vdec, g_step_cells, (int)f.src, (unsigned)f.seq);
 }
 
 // Act on one queued frame. Never called while a homomorphic step is in
-// flight — several of these branches call he_step() or read `cached_en`.
+// flight — several of these branches call he_step() or compute a verdict.
 // Ask `node` to prove the epoch it is running NOW: a fresh 64-bit nonce it
 // must send back in a tagged M_RESP. At most one challenge per node per
 // 250 ms, answered or not: limiting only while one was pending let every
@@ -1512,12 +1469,23 @@ static void dispatch(const DesFrame& f) {
                 tx(M_VOTE, f.ev, f.seq, 0);                          // busy -> no
                 break;
             }
+            // A YES this initiator already has, on a state that has not moved
+            // since: the vote still holds — say it again without recomputing.
+            if (g_lock_by == f.src && g_vote_ev == f.ev && g_vote_ver == g_state_ver) {
+                g_lock_t0 = des_millis();
+                tx(M_VOTE, f.ev, f.seq, 1);
+                break;
+            }
             bool ok = local_enabled(f.ev);
-            if (ok) { g_lock_by = f.src; g_lock_t0 = des_millis(); }
+            if (ok) {
+                g_lock_by = f.src; g_lock_t0 = des_millis();
+                g_vote_ev = f.ev;  g_vote_ver = g_state_ver;
+            }
             tx(M_VOTE, f.ev, f.seq, ok ? 1 : 0);
             DES_REACT_TAG();
-            DES_LOG("vote   %-4s  %-3s to node %d          (seq %u)\n",
-                    ev_name(f.ev, nm), ok ? "YES" : "NO", (int)f.src, (unsigned)f.seq);
+            DES_LOG("vote   %-4s  %-3s to node %d          (seq %u, %d dec, %.1f ms)\n",
+                    ev_name(f.ev, nm), ok ? "YES" : "NO", (int)f.src, (unsigned)f.seq,
+                    g_step_decrypts, g_verdict_us / 1000.0);
             break;
         }
         case M_ABORT:
@@ -1642,7 +1610,8 @@ static int      g_veto_ev     = -1;
 static uint32_t g_veto_repeat = 0;
 static const char* g_block_why = "";      // why the last FIRE_BLOCKED happened
 
-static FireResult fire(int gi, uint32_t occ, uint64_t* he_us, uint64_t* net_us) {
+static FireResult fire(int gi, uint32_t occ, bool own_ok, int vdec,
+                       uint64_t* he_us, uint64_t* net_us) {
     *he_us = 0; *net_us = 0;
     if (g_safe_halt) return FIRE_HALT;
     char nm[16]; ev_name(gi, nm);
@@ -1657,10 +1626,11 @@ static FireResult fire(int gi, uint32_t occ, uint64_t* he_us, uint64_t* net_us) 
         return FIRE_BLOCKED;
     }
 
-    // Phase 0 — my own verdict. A cached bit: no crypto, no traffic.
-    // Only CONTROLLABLE events may be held back; an uncontrollable one has
-    // already happened in the plant, and a supervisor may not disable it.
-    if (!local_enabled(gi)) {
+    // Phase 0 — my own verdict, computed by drive_one() from the current
+    // encrypted state. Only CONTROLLABLE events may be held back; an
+    // uncontrollable one has already happened in the plant, and a supervisor
+    // may not disable it.
+    if (!own_ok) {
         if (r.controllable) {
             g_block_why = "my own supervisor disables it here";
             return FIRE_BLOCKED;
@@ -1683,7 +1653,6 @@ static FireResult fire(int gi, uint32_t occ, uint64_t* he_us, uint64_t* net_us) 
         mono_check_and_step(gi, "local");
         *he_us = he_step(gi);
         oracle_step(gi);
-        oracle_verify(nm);
         // MUST use the announcement counter, never g_my_seq. g_my_seq is the
         // gap-checked COMMIT sequence that participants validate with
         // `seq == last + 1`; bumping it here inflates it by the number of local
@@ -1693,8 +1662,8 @@ static FireResult fire(int gi, uint32_t occ, uint64_t* he_us, uint64_t* net_us) 
         tx(M_ANNOUNCE, (uint8_t)gi, ++g_ann_seq, 0, occ);
 #endif
         DES_STEP_TAG();
-        DES_LOG("local  %-4s  %8.1f ms HE  %3d dec  %d frames\n",
-                nm, *he_us/1000.0, g_step_decrypts, (int)(DES_BENCH_LOCKSTEP ? 1 : 0));
+        DES_LOG("local  %-4s  %8.1f ms HE  %3d dec %4d cells  %d frames\n",
+                nm, *he_us/1000.0, vdec, g_step_cells, (int)(DES_BENCH_LOCKSTEP ? 1 : 0));
         return FIRE_OK;
     }
 
@@ -1766,7 +1735,6 @@ static FireResult fire(int gi, uint32_t occ, uint64_t* he_us, uint64_t* net_us) 
     mono_check_and_step(gi, r.controllable ? "2pc" : "notify");
     *he_us = he_step(gi);
     oracle_step(gi);
-    oracle_verify(nm);
 
     uint32_t acked = collect(M_ACK, seq, need, DES_ACK_TIMEOUT_MS, nullptr);
     for (int a = 1; a < DES_ACK_RETRIES && acked != need; ++a) {
@@ -1789,9 +1757,9 @@ static FireResult fire(int gi, uint32_t occ, uint64_t* he_us, uint64_t* net_us) 
     tx(M_ANNOUNCE, (uint8_t)gi, ++g_ann_seq, 0, occ);
 #endif
     DES_STEP_TAG();
-    DES_LOG("%-6s %-4s  %8.1f ms HE  %3d dec  %d frames  + %.1f ms peer-wait"
+    DES_LOG("%-6s %-4s  %8.1f ms HE  %3d dec %4d cells  %d frames  + %.1f ms peer-wait"
             "  (seq %u)\n", r.controllable ? "2pc" : "notify", nm, *he_us/1000.0,
-            g_step_decrypts,
+            vdec, g_step_cells,
             r.controllable ? 2 + 2*__builtin_popcount(need) : 1 + __builtin_popcount(need),
             *net_us/1000.0, (unsigned)seq);
     return FIRE_OK;
@@ -1887,6 +1855,10 @@ static void print_summary() {
         DES_LOG("     (compare against the round-trip probe above: the excess is\n");
         DES_LOG("      the peer's own HE work, not the link.)\n");
     }
+    DES_LOG("  homomorphic work: %llu decryptions, %llu encryptions of zero "
+            "(%.1f s drawing them, which a pool drawn in advance would save)\n",
+            (unsigned long long)g_dec_total, (unsigned long long)g_cells_total,
+            g_gen_us / 1e6);
     DES_LOG("  frames: tx=%u rx=%u retransmits=%u\n",
             (unsigned)g_tx, (unsigned)g_rx, (unsigned)g_retx);
     DES_LOG("  authentication: HMAC-SHA256/128, %.1f us per frame; %u rejected "
@@ -1926,10 +1898,10 @@ static void print_summary() {
     DES_LOG("  ----------------------------------------------------------\n");
     DES_LOG("  homomorphic vs cleartext oracle : %s\n",
             g_he_mismatch ? "FAIL — HE diverged from the clear model"
-                          : "PASS — every encrypted bit matched");
-    DES_LOG("     (PASS certifies the cryptography: each node's encrypted bits\n");
-    DES_LOG("      match its own clear model for the events it applied. It does\n");
-    DES_LOG("      not certify the distributed run — read the skips for that.)\n");
+                          : "PASS — every decision matched");
+    DES_LOG("     (PASS certifies the cryptography: every decision this node\n");
+    DES_LOG("      computed matched its own clear model. It does not certify\n");
+    DES_LOG("      the distributed run — read the skips for that.)\n");
 #if DES_MONO_ACTIVE
     DES_LOG("  distributed vs MONOLITHIC sup.  : %s (%u events replayed)\n",
             g_mono_ok ? "PASS — nothing fired that the centralised supervisor forbids"
@@ -2036,14 +2008,25 @@ static bool drive_one(int gi, uint32_t occ, uint32_t timeout_ms) {
     uint32_t backoff = 50;                        // grows while a veto stands
     FireResult last = FIRE_OK;
     g_veto_ev = -1; g_veto_repeat = 0;
+    uint32_t ver = g_state_ver - 1;               // no verdict yet
+    bool     own_ok = false;
+    int      vdec = 0;
+    uint64_t vus = 0;
     while (!g_safe_halt) {
         pump();
+        // My verdict can only change when my state does, so it is computed
+        // again only after a step — not at every turn of this loop, which
+        // would cost a zero test per supervisor each time.
+        if (ver != g_state_ver) {
+            ver = g_state_ver;
+            own_ok = local_enabled(gi); vdec = g_step_decrypts; vus = g_verdict_us;
+        }
         // A controllable event my supervisors disable may become allowed once
         // the plant moves on, so it is waited for. An uncontrollable one goes
         // straight to fire(): by the time this node reaches the step, every
         // earlier event that concerns its supervisors has been applied, so a
         // disabled one is impossible, and fire() rejects it at once.
-        if (r.controllable && !local_enabled(gi)) {
+        if (r.controllable && !own_ok) {
             des_sleep_ms(5);
             if (des_millis() - t0 > timeout_ms) {
                 g_drive_why = "my own supervisor disables it here";
@@ -2052,9 +2035,10 @@ static bool drive_one(int gi, uint32_t occ, uint32_t timeout_ms) {
             continue;
         }
         uint64_t he = 0, net = 0, a0 = des_micros();
-        FireResult fr = fire(gi, occ, &he, &net);
+        FireResult fr = fire(gi, occ, own_ok, vdec, &he, &net);
         if (fr == FIRE_OK) {
-            uint64_t wall = des_micros() - a0;
+            he += vus;                            // the verdict that let it fire
+            uint64_t wall = des_micros() - a0 + vus;
             if (!r.shared)           g_acc_local .add(he, net, wall);
             else if (r.controllable) g_acc_ctrl  .add(he, net, wall);
             else                     g_acc_unctrl.add(he, net, wall);
@@ -2104,10 +2088,10 @@ static bool drive_one(int gi, uint32_t occ, uint32_t timeout_ms) {
 
 // How long an owner waits for its participants to REACH a shared step before
 // giving up on it. Generous on purpose: this is the plant catching up, not a
-// network fault, and on FMS the board holding S4/S5/S6 needs ~15 s to walk
-// the local events that separate two shared ones.
+// network fault, and on FMS the board holding S4/S5/S6 needs minutes to walk
+// the local events that separate two shared ones, every cell re-randomized.
 #ifndef DES_SYNC_TIMEOUT_MS
-#define DES_SYNC_TIMEOUT_MS 60000
+#define DES_SYNC_TIMEOUT_MS 600000
 #endif
 
 // The plant half of a synchronous product.
@@ -2246,7 +2230,7 @@ static void run_benchmark() {
             // already resolved and costs no time at all.
             uint32_t t0 = des_millis(), tat = 0;
             while (g_resolved_occ[gi] < occ && !g_safe_halt) {
-                if (part && (tat == 0 || des_millis() - tat > 300)) {
+                if (part && (tat == 0 || des_millis() - tat > 1000)) {
                     tx(M_AT, (uint8_t)gi, 0, 0, occ);
                     tat = des_millis();
                 }
@@ -2310,16 +2294,14 @@ static void des_setup() {
     DES_LOG("--- encrypting my supervisors' initial states ---\n");
     load_my_supervisors();
     if (!init_states()) { safe_halt("encryption of the initial state failed"); return; }
-    warm_cache();
 
     g_oracle.resize(g_sups.size());
     for (size_t i = 0; i < g_sups.size(); ++i) g_oracle[i].init(g_sups[i].desc);
 #if DES_MONO_ACTIVE
     g_mono.init(&MONO_SUP);
 #endif
-    oracle_verify("init");
     DES_LOG("[init] my keypair is mine alone; no ciphertext ever leaves this node\n");
-    { char nm[16]; DES_LOG("[init] my enablement:");
+    { char nm[16]; DES_LOG("[init] my enablement (computed now, not kept):");
       for (int gi = 0; gi < EVENT_COUNT; ++gi)
           DES_LOG(" %s=%d", ev_name(gi, nm), (int)local_enabled(gi));
       DES_LOG("\n\n"); }

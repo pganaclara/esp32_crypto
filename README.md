@@ -154,7 +154,10 @@ from one step to the next: no decision is stored on the board.
 `des_distributed/` runs the same homomorphic core, but each node holds **only its
 own supervisors**, encrypted under **its own keypair**. No ciphertext crosses the
 network — only enablement bits — so there is no shared homomorphic key, no
-threshold cryptography and no re-encryption.
+threshold cryptography and no re-encryption. As on one board, every cell of a
+supervisor that moves is re-randomized after every event; a node computes a
+decision only when it needs one (to fire, to vote, to check a reported event)
+and does not keep it.
 
 Routing is derived at boot from the generated header:
 
@@ -261,8 +264,9 @@ entropy); the firmware is research-grade.
 | 6 | Events processed in clear | **Open** on one board; `des_split/` never sends them to the supervisor's board | replaying them gives the state |
 
 A process reading memory continuously could still see the randomness and the
-event as they are processed. `des_distributed/` still reuses one fixed `Enc(0)`
-and keeps the decisions: channels 2–4 are open there.
+event as they are processed. `des_distributed/` closes channels 2–4 the same
+way: each node re-randomizes its moving supervisors after every event and
+computes a decision only when it needs it, without keeping it.
 
 In the distributed engine, frames are authenticated but not encrypted: the state
 stays encrypted, but the timing of shared events is visible on the wire.
@@ -298,10 +302,12 @@ override with `DES_CONTROLLABLE_MASK`).
 * **Supervisor and plant on two boards:** both roles compile with zero warnings
   for the ESP32-S3; on a Linux host (mock group) the 2- and 3-cluster tools pass
   every step, also with 20 % of the frames dropped. Not yet run on the boards.
-* **Distributed:** two ESP32-S3 boards run `fms` for 5 cycles — 220/220 steps,
-  0 skipped, oracle `PASS` on both, 100 + 397 decryptions as predicted. The
-  engine also runs on Linux (`host_main.cpp`) under injected loss, reboots and
-  forged or replayed frames. Details in
+* **Distributed:** the current engine (protocol version 7, fresh randomness,
+  no decision kept) compiles with zero warnings and passes every problem on
+  Linux with a test double for the cryptography, also under 30 % frame loss;
+  not yet run on the boards. Version 6 ran on two ESP32-S3 boards: `fms` for 5
+  cycles, 220/220 steps, 0 skipped, oracle `PASS` on both, 100 + 397
+  decryptions as predicted. Details in
   [`des_distributed/README.md`](des_distributed/README.md#verification-status).
 
 ---

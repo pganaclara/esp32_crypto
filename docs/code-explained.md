@@ -36,10 +36,11 @@ author lists could not be confirmed are marked as such rather than guessed.
 | `notebook/generator_ultrades.ipynb` | where the data comes from |
 
 The single-board sketch and the distributed engine share the same cryptographic
-core, but no longer verbatim: the single-board sketch re-randomizes every cell
-after every transition and keeps no decision between steps, while the
-distributed engine still reuses one fixed `Enc(0)` and caches its decisions
-(§4, §7). Read the sketch first.
+core: both re-randomize every cell after every transition and keep no decision
+between steps. The single board decides every controllable row at every step;
+a distributed node computes only the decision it needs, when it needs it — to
+fire an event, to vote, to check a reported event (§4, §7). Read the sketch
+first.
 
 The current single-board code has not been run yet; §4.6 gives the measurements
 of the earlier code and the static model's prediction for the current one.
@@ -686,7 +687,7 @@ in this project were all of the form *"the check and the thing being checked
 shared a mistake"*.
 
 **On-board cleartext oracle.** Each node mirrors its own supervisors in plaintext
-and compares every homomorphic enablement bit against it after every step. This
+and compares every decision it computes homomorphically against it. This
 validates the crypto layer against the automaton semantics. Across the nine
 ESP32-S3 runs — three problems × three families, minus the `fms` monolithic which
 does not fit in flash — every step matched: 4, 4, 4, 6, 6, 6, 44 and 44 steps
@@ -740,9 +741,9 @@ power analysis of the decryption scalar multiplication.
 | # | Channel | Status |
 |---|---|---|
 | 1 | Timing/power on the private scalar | **Closed** by default via scalar blinding [5]; see [6][7] on why blinding alone is not sufficient without a regular ladder |
-| 2 | Byte-equality — inactive cells identical to one fixed `Enc(0)` | **Closed** on one board and in `des_split`: every cell gets a fresh `Enc(0)` after every transition (~140 ms per cell, §4.3). **Open** in the distributed engine |
-| 3 | Active-ciphertext propagation — the active cell's bytes copied unchanged | **Closed** the same way; **open** in the distributed engine |
-| 4 | **Decisions kept in RAM** between steps | **Closed** on one board and in `des_split` (recomputed every step, §4.1); **open** in the distributed engine |
+| 2 | Byte-equality — inactive cells identical to one fixed `Enc(0)` | **Closed** in every sketch: every cell gets a fresh `Enc(0)` after every transition (~140 ms per cell, §4.3) |
+| 3 | Active-ciphertext propagation — the active cell's bytes copied unchanged | **Closed** the same way |
+| 4 | **Decisions kept in RAM** between steps | **Closed** in every sketch: computed when needed (§4.1), never stored |
 | 5 | **Decision leakage** — the enablement bits are, by construction, revealed to the plant | Inherent. This is what opacity theory [8] analyses |
 | 6 | **Key and events on the board that holds the state** | **Open** on one board; `des_split` keeps both on the plant's board, and the supervisor's board never learns the event |
 | 7 | **Traffic analysis** (distributed and `des_split`) — frames are fixed-size, but the timing of steps is visible | Open; cover traffic would be the next step |

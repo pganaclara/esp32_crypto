@@ -6,6 +6,12 @@ ciphertexts under **its own** keypair. The event routing, the owner election,
 the shared/local partition and the participant sets are all **derived at boot**
 from the generated header; nothing is specific to a plant or a board.
 
+After every event a node applies, every cell of its supervisors that move gets
+a fresh encryption of zero, and no node keeps a decision: each computes the one
+it needs — to fire an event, to vote, to check a reported event — from the
+encrypted state when it needs it, and does not store it. A memory snapshot of a
+node shows neither its supervisors' state nor their decisions.
+
 ```
 des_generic.h        the engine    — no Arduino, no FreeRTOS, no ESP-IDF
 des_transport.h      the transport — UDP/IP multicast
@@ -139,8 +145,8 @@ observer sees which shared events happen and how nodes vote (OPC UA's
 *SignAndEncrypt* mode adds that) — and **key distribution**: the key is
 pre-shared by hand, where OPC UA would use a Security Key Service.
 
-**Checks on every run.** Each node compares every homomorphic bit against a
-cleartext oracle of its own supervisors, and every scripted step is gated on
+**Checks on every run.** Each node compares every decision it computes against
+a cleartext oracle of its own supervisors, and every scripted step is gated on
 admissibility: a step the supervisors disable is skipped and reported, never
 fired. With `DES_BENCH_LOCKSTEP 1` and a header that carries a monolithic
 supervisor, the global trace is also replayed against it.
@@ -168,23 +174,21 @@ shows `12=1` with the reduced family and `12=0` with the full one). This is why 
 
 ### 3a. Cost, and why the engine keeps reading the socket while it computes
 
-One scalar multiplication on secp192r1 costs **~69 ms** on an ESP32-S3 (the chip
-has no ECC accelerator, unlike the C6 and H2). A node owes **one per distinct
-enablement-row sum it must re-evaluate**, not one per state: `row_decrypt()` sums
-a row homomorphically and performs a single blinded scalar multiplication on the
-sum; extra possible states only add `mbedtls_ecp_muladd` calls at ~5 ms each.
-Rows whose sums cover the same ciphertexts share one decryption.
+Applying an event costs a fresh encryption of zero for every cell of the
+supervisors that move: two scalar multiplications on secp192r1, **~140 ms** a
+cell on an ESP32-S3 (the chip has no ECC accelerator, unlike the C6 and H2). On
+`fms` local modular, the node holding S4–S6 owes 252 of them for a robot event,
+about 35 s. A decision costs one blinded scalar multiplication (**~69 ms**) per
+local supervisor that constrains the event, on the homomorphic sum of every
+enabled cell of its row, and only the decisions a node needs are computed: the
+event it is about to fire, a vote, a reported uncontrollable event.
 
-| | ms per decryption |
-|---|---|
-| node holding S0–S3 (rows over 2–4 states) | 75.5 |
-| node holding S4–S6 (rows over up to 13 states) | ~100 |
+Before protocol version 7 the engine reused one fixed encryption of zero and
+kept every decision, re-decrypting only rows that could change; on `fms` over
+two boards cycle 1 then cost 20 + 125 = 145 decryptions with the reduced family
+and steps of hundreds of milliseconds (§ Verification status).
 
-On `fms` over two boards, cycle 1 costs 20 + 125 = **145** decryptions — exactly
-what the single-board sketch measures for fms REDUCED. Distributing splits the
-cryptographic work; it does not add to it.
-
-A homomorphic step therefore takes hundreds of milliseconds, and lwIP's UDP
+A homomorphic step therefore takes seconds to tens of seconds, and lwIP's UDP
 receive mailbox holds only `CONFIG_LWIP_UDP_RECVMBOX_SIZE` = **6** datagrams (an
 Arduino build links precompiled ESP-IDF libraries and cannot change it). A node
 that stops calling `recvfrom()` for longer than it takes its peers to send seven
@@ -192,20 +196,24 @@ frames loses everything after the sixth, silently. So the engine separates
 *reading* the socket from *acting* on what arrives:
 
 * `he_yield()` moves datagrams from the kernel into `g_rxq`. It touches no
-  supervisor state and sends nothing, so it is called between the scalar
-  multiplications inside `row_decrypt()`.
+  supervisor state and sends nothing, so it is called before every cell's
+  encryption of zero in `rerandomize()` and before the scalar multiplication
+  in `row_decrypt()`.
 * `pump()` dispatches from that queue, and refuses to while `g_in_he` is set:
   handling an `M_COMMIT` mid-step would re-enter `he_step()`, and answering an
-  `M_REQ` would vote from a half-updated `cached_en`.
+  `M_REQ` would judge a half-updated state.
 
 Frames are delayed by at most one homomorphic step instead of being destroyed.
-`rx queue: peak N/64` in the summary reports the high-water mark; if it ever
+Because a step can last tens of seconds, a participant acknowledges a `COMMIT`
+or `NOTIFY` only when its current step ends, so the initiator keeps
+retransmitting for up to 60 s (`DES_ACK_TIMEOUT_MS` × `DES_ACK_RETRIES`) before
+it halts. `rx queue: peak N/256` in the summary reports the high-water mark; if it ever
 reports `DROPPED`, raise `DES_RXQ_LEN`, but read it as a node that is not keeping
 up with its peers.
 
 A caution about the on-board check: both nodes can report `oracle PASS` through a
 badly desynchronised run. The oracle compares ciphertext against cleartext **for
-the events that node applied**; it cannot know they were the wrong ones. `PASS`
+the decisions that node computed**; it cannot know the events were the wrong ones. `PASS`
 certifies the cryptography, not the distributed execution — read the skip count
 alongside it.
 
@@ -257,8 +265,10 @@ editing.
 | `DES_BENCH_LOCKSTEP` | `0` | 0 = each node walks freely, waiting only on SHARED events (recommended); 1 = every node replays the whole trace — reproducible, but needs the nodes to keep step |
 | `DES_WORK_MS` | `250` (the sketch sets `0`) | simulated machine time before each uncontrollable event; `0` times the cryptography and the protocol alone, as the single-board sketch does. Every node prints `-- cycle N/R done at X ms --` on a run clock common to all nodes (it starts when node 1's round-trip probe ends), and repeats the values in its summary; a cycle is over at the latest node's value |
 | `DES_SIMULATE_LOSS_PCT` | `0` | inject loss: `30` exercises retransmission, `90` forces a SAFE HALT |
-| `DES_RXQ_LEN` | `64` | receive queue depth, power of two — see §3a |
-| `DES_SYNC_TIMEOUT_MS` | `60000` | how long an owner waits for its participants to reach a shared step — see §3b |
+| `DES_RXQ_LEN` | `256` | receive queue depth, power of two — see §3a |
+| `DES_STEP_TIMEOUT_MS` | `120000` | how long a node tries to fire one step before skipping it |
+| `DES_ACK_TIMEOUT_MS` × `DES_ACK_RETRIES` | `1500` × `40` | how long an initiator waits for a busy participant's acknowledgement before it halts — see §3a |
+| `DES_SYNC_TIMEOUT_MS` | `600000` | how long an owner waits for its participants to reach a shared step — see §3b |
 | `DES_MCAST_LOOP` | `0` | `1` to run several nodes on one host (testing) |
 | `DES_INJECT_EVENT` / `DES_INJECT_AT_STEP` | *(off)* / `0` | plant-check demonstration: at that step of cycle 1 the event's owner acts as if a sensor reported it and prints `ACCEPTED` or `REJECTED`; nothing is applied |
 
@@ -292,7 +302,7 @@ a machine's actuator lives on a specific board.
      as `FAILED AUTHENTICATION` and never joins.
 3. Flash each board with a different `DES_NODE_ID`. At boot each prints
    `[init] config fingerprint XXXXXXXX`; the values must match (fms / 2 nodes /
-   lockstep off → `edbd7971` with `LMOD`, `d79ed5b9` with `LMOD_RED`).
+   lockstep off → `9565c5d0` with `LMOD`, `39b55c58` with `LMOD_RED`).
 
 On an **ESP32-S3** on its native USB port, set `USB CDC On Boot: Enabled`; a
 board-package update can reset it, and the symptom is a blank Serial Monitor.
@@ -314,6 +324,22 @@ same `secrets.h`. To run several nodes on **one** host, add `-DDES_MCAST_LOOP=1`
 
 ### Verification status
 
+* **Protocol version 7 — fresh randomness in every cell, decisions computed on
+  demand.** Compiles for the ESP32-S3 with zero warnings; not yet run on the
+  boards. On Linux, with the test double described below (same algebra, no
+  security), two processes over real UDP multicast, every run complete with
+  oracle `PASS` on both nodes, 0 skips and no halt: `small_factory`,
+  `extended_small_factory` (full and reduced, and lockstep with the monolithic
+  cross-check), `fms` full and reduced, `cluster_tool_2`, and `fms` full with
+  30 % injected loss (31 retransmissions). On `fms` full local modular, one
+  cycle draws 1 500 + 6 528 = 8 028 encryptions of zero — the single-board
+  count — and needs 109 + 103 decryptions.
+  With every scalar multiplication slowed to the S3's ~70 ms, the same `fms`
+  cycle completes too: 44/44 steps, oracle `PASS`, no halt, no retransmission;
+  the node holding S4–S6 applies a shared event in 35.6 s (252 cells), and the
+  cycle ends at 936 s on the run clock.
+* **Everything below was measured with protocol version 6**, which reused one
+  fixed encryption of zero and kept the decisions between steps.
 * **ESP32 build.** Compiles with `-Wall -Wextra` and zero warnings against ESP32
   Arduino core 3.3.12 (`xtensa-esp32s3-elf-g++`), across all three problems ×
   2 and 3 nodes × all three families × lockstep on and off.
