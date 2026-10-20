@@ -16,7 +16,7 @@ author lists could not be confirmed are marked as such rather than guessed.
 - [1. The data model — what the notebook emits](#1-the-data-model)
 - [2. The cryptographic layer](#2-the-cryptographic-layer)
 - [3. Homomorphic supervisor evaluation](#3-homomorphic-supervisor-evaluation)
-- [4. The six optimisations, and what they really cost](#4-the-six-optimisations)
+- [4. The optimisations, and what they really cost](#4-the-optimisations)
 - [5. The distributed engine](#5-the-distributed-engine)
 - [6. The verification apparatus](#6-the-verification-apparatus)
 - [7. Threat model and limitations](#7-threat-model-and-limitations)
@@ -32,16 +32,17 @@ author lists could not be confirmed are marked as such rather than guessed.
 | `homomorphic-esp32-ultrades.ino` | the homomorphic core, single board |
 | `des_distributed/des_generic.h` | the same core, plus partitioning and the protocol |
 | `des_distributed/des_transport.h` | how frames get to the other nodes |
+| `des_split/des_split.h` | supervisor and plant on two boards: the key, the events and the decisions stay on the plant's |
 | `notebook/generator_ultrades.ipynb` | where the data comes from |
 
 The single-board sketch and the distributed engine share the same cryptographic
-core essentially verbatim. Read the sketch first; the engine adds distribution on
-top of an identical inner loop.
+core, but no longer verbatim: the single-board sketch re-randomizes every cell
+after every transition and keeps no decision between steps, while the
+distributed engine still reuses one fixed `Enc(0)` and caches its decisions
+(§4, §7). Read the sketch first.
 
-Measured end state, ESP32-S3, all families `PASS` against the cleartext oracle:
-37.5 ms per step on `small_factory`, 50.0 ms on
-`extended_small_factory`, 241.1 ms on `fms` (44-step trace, 7 supervisors,
-largest 164 states). Full tables in §4.6.
+The current single-board code has not been run yet; §4.6 gives the measurements
+of the earlier code and the static model's prediction for the current one.
 
 ---
 
@@ -90,8 +91,7 @@ conjunction across supervisors (§5.3) works without any special-casing.
 
 Measured ciphertext held per family on `fms`: 16 350 B for the seven
 local-modular supervisors against 1 850 B for the reduced ones — 8.8×, the one
-dimension where reduction delivers exactly what it promises (§4.7 covers the
-dimension where it does not behave as expected).
+dimension where reduction delivers exactly what it promises.
 
 **`tcnt[gi]`** is how many `(from,to)` pairs event `gi` has, and **`trans`** is
 those pairs concatenated in event order. `trans_offset()` recovers the start of
@@ -111,11 +111,12 @@ points), that is not affordable.
 ### 1.4 What the header does *not* carry
 
 **Controllability.** The header records which events each supervisor *permits*,
-but not which events are controllable in the first place. The single-board sketch
-does not need this — it only evaluates enablement. The distributed engine does,
-because controllability decides whether an event can be put to a vote (§5.4), so
-`derive_controllable()` infers it from event labels and prints what it inferred
-at boot. Override with `DES_CONTROLLABLE_MASK`.
+but not which events are controllable in the first place. Every sketch infers it
+from the event labels with `derive_controllable()`: the single-board sketch and
+`des_split` to skip the rows of uncontrollable events, which a supervisor never
+disables (§4.1), and the distributed engine because controllability decides
+whether an event can be put to a vote (§5.4); it prints what it inferred at boot,
+and `DES_CONTROLLABLE_MASK` overrides it.
 
 This is worth stating explicitly in any write-up: controllability is a modelling
 input that survives synthesis only implicitly, and re-deriving it downstream is a
@@ -239,9 +240,9 @@ Two caveats worth stating honestly in a write-up:
 - **Each core needs its own DRBG.** mbedTLS's CTR-DRBG is not thread-safe. The
   single-board sketch runs decrypts on both cores, so it maintains `g_drbg` and
   `g_drbg_core0` and selects by `xPortGetCoreID()`.
-- **Blinding addresses the timing/power channel only.** The two memory channels
-  in §7 are untouched by it, and §4.7 shows how thoroughly the firmware depends
-  on one of them.
+- **Blinding addresses the timing/power channel only.** The memory channels in
+  §7 are closed by other means: re-randomization (§4.3) and keeping no decision
+  between steps (§4.1).
 - **Its cost is not separately visible.** The 69 ms measured for a blinded
   scalar multiplication is the whole per-decryption budget; blinding is folded
   into it and was never measured against an unblinded build on this hardware.
@@ -292,20 +293,18 @@ semantic meaning. (Supervisor reduction relabels states freely, so regenerating 
 header reorders these arrays; measured on the current FMS header, the buggy form
 reports a different enablement at **21 of 44** steps for the reduced family.)
 
-The correct implementation exploits the fact that most cells hold a literal
-`Enc(0)`:
+The correct implementation copies the first source into an empty target and
+adds the next ones homomorphically:
 
 ```c
-if (is_g_zero(sv.enc[from])) continue;   // contributes nothing to a union
-if (is_g_zero(nxt[to])) { nxt[to] = sv.enc[from]; /* + copy cached points */ }
-else                    { /* two ACTIVE sources converge: homomorphic add */ }
+if (!filled[to]) { filled[to] = 1; nxt[to] = sv.enc[from]; /* + cached points */ }
+else             { /* sources converge: homomorphic add, the same OR */ }
 ```
 
-Skipping zero sources makes the common path both correct and free — it is exactly
-the same number of copies as before. The homomorphic-add branch is unreachable
-for a genuine one-hot vector (only one cell is active), but is implemented rather
-than assumed, because "the state vector is one-hot" is an invariant of the
-*model*, not something the transition code can verify on ciphertext.
+A target that no source reaches stays empty, the point at infinity in the
+cache, and `rerandomize()` then makes every cell — copied, added or empty — a
+fresh ciphertext (§4.3). Nothing is skipped, because no cell is recognisable as
+an encryption of zero.
 
 ### 3.3 The enablement query
 
@@ -319,68 +318,60 @@ enabled(gi)  =  ⋁_{s ∈ A} cur[s]
 
 Because the vector is one-hot, the sum is 1 if the active state is in `A` and 0
 otherwise — so the additive homomorphism computes a logical OR, and the zero test
-reads it off. `row_decrypt()` implements exactly this, fused (§4.4).
+reads it off. `row_decrypt()` implements exactly this (§4.4).
 
 **What leaks, and what does not.** The result of this query is a single bit, and
 that bit is the supervisor's control decision — it must be revealed, because it
 is what actuates the plant. The *state distribution* is never decrypted on the
 normal path.
 
-That is the claim at the level of the cryptography. At the level of *this
-implementation* it is weaker, and §4.7 quantifies why: the `g_zero` short-circuit
-identifies inactive cells by `memcmp`, and once that set contracts to a single
-cell the firmware has located the active state in plaintext without using the
-key. Measured on `fms`, that contraction happens by step 4 for three of the seven
-supervisors and by step 16 for all but one. This is the precise privacy claim, and it should be stated that
-narrowly: an observer of the decisions learns the enablement sequence, which for
-a deterministic supervisor can be highly informative. Quantifying what the
+Every cell is re-randomized after every transition (§4.3), so no cell is
+recognisable, and no decision is stored between steps (§4.1): a memory snapshot
+shows neither the active state nor the current decisions. (The earlier code
+reused one fixed `Enc(0)` for inactive cells, and once they contracted to the
+active cell the firmware had located it without the key — by step 4 for three
+of the seven `fms` supervisors.) The precise privacy claim should still be
+stated narrowly: the decisions are revealed when they drive the plant, and an
+observer of them learns the enablement sequence, which for a deterministic
+supervisor can be highly informative. Quantifying what the
 decision sequence reveals about the state trajectory is exactly the question
 **opacity** theory asks [8], and connecting the two is open work rather than
 something this implementation settles.
 
 ---
 
-## 4. The six optimisations
+## 4. The optimisations
 
-Measured end state on ESP32-S3: **37.5 ms/step** on `small_factory`,
-**50.0 ms** on `extended_small_factory`, **241.1 ms** on `fms` — all for the
-reduced family, which after optimisation 6 is the fastest everywhere.
+The current code has four, and none depends on the state or on a decision:
+the persistent decompressed cache (§4.2), dropping the rows of uncontrollable
+events (§4.1), deciding equal rows once (§4.7), and the dual-core split (§4.5).
+Two earlier ones were removed because each worked by reading something a memory
+snapshot should not reveal: keeping the decisions between steps (§4.1) and
+skipping a fixed `Enc(0)` (§4.3). The measurements in §4.5–§4.6 are from that
+earlier code.
 
-Each optimisation is sound for a specific reason, and the reasons matter more
-than the speedups. Two of them turned out to be worth much less than they look
-(§4.5), and one of them is the same mechanism as a side channel (§4.3).
+### 4.1 Rows that are computed — and conditional invariance, removed
 
-### 4.1 Conditional invariance — the largest win
+A supervisor never disables an uncontrollable event, so only the rows of the
+**controllable** events with at least one disabling state are summed and
+decrypted; a row with no enabled state is decided from the table, with no sum.
+And because no decision is kept, **every** such row of **every** supervisor is
+decided again at every step, including the supervisors that did not move.
 
-Naively, every transition invalidates every cached enablement bit, so every row
-of every supervisor must be re-decrypted. Almost none of them can actually have
-changed.
-
-At load time, for each `(supervisor, event ev, row gi)` the code precomputes
-whether the row's OR-sum can flip:
+The earlier code kept each decision in RAM (`cached_en`) and re-decrypted only
+the rows whose value could change. At load time it precomputed, for each
+`(supervisor, event ev, row gi)`:
 
 ```
 0 → 1 possible  ⟺  ∃ (f,t) ∈ δ(ev) with  f ∉ A  and  t ∈ A
-                   (an outside state moves into the enabled set)
-
-1 → 0 possible  ⟺  ∃ s ∈ A with  s has no transition on ev,
-                   or  δ(ev)(s) ∉ A
-                   (an enabled state leaves, or falls out of the set)
+1 → 0 possible  ⟺  ∃ s ∈ A with  s has no transition on ev,  or  δ(ev)(s) ∉ A
 ```
 
-Rows in neither list are invariant under that event and keep their cached bit
-with no EC work at all. At runtime only rows whose *current cached value* matches
-the possible flip direction are enqueued:
-
-```c
-for (uint8_t li : sv.changes_if_zero[ev]) if (sv.cached_en[li] == 0) …
-for (uint8_t li : sv.changes_if_one [ev]) if (sv.cached_en[li] == 1) …
-```
-
-This is a static analysis of the automaton, computed once, that soundly
-over-approximates which decisions can change. It is the reason a step can
-sometimes cost *zero* decryptions — measured at ~0.2 ms, against 37–234 ms for a
-step that does work. On `fms` reduced, 8 of 44 steps cost nothing at all.
+and at run time enqueued a row only if its cached bit was 0 and could become 1,
+or 1 and could become 0. That needs the decisions in RAM, and the decisions
+narrow down the state, so it was removed. The static model counts the price:
+on `fms` local modular, 1 408 zero tests per cycle instead of 553; about 2 s
+more per step, against the 25.6 s that the encryptions of zero cost anyway.
 
 ### 4.2 Persistent decompressed cache
 
@@ -390,30 +381,29 @@ ciphertexts via `mbedtls_ecp_copy` (an MPI copy, not EC arithmetic), removes
 decompression from the hot path entirely. The cost is RAM: two EC points per
 cell alongside the 50-byte ciphertext.
 
-### 4.3 Skipping `Enc(0)` summands
+### 4.3 Re-randomizing every cell (and the skipped `Enc(0)` it replaced)
 
-Non-active cells are set to a single global constant `g_zero`, so they are
-*byte-identical*, and `is_g_zero()` is a `memcmp`. `row_decrypt` skips them, so a
-row that nominally sums dozens of cells typically sums one or two. On `fms` local
-modular the set of cells that are *not* `g_zero` contracts from 327 to 7 over a
-run; on the reduced family, from 37 to 7.
+After every transition, `rerandomize()` adds a fresh encryption of zero,
+`(rG, rY)`, to every cell of each supervisor that moved; an empty cell (no
+source reached it) simply becomes `(rG, rY)`, since mbedTLS refuses to add the
+point at infinity. The bits do not change; the randomness of every cell does.
+Drawing one costs two scalar multiplications, 140 ms on the ESP32-S3: 8 028 of
+them per `fms` cycle, 93 % of the measured time. They depend on neither the
+event nor the state, so a pool drawn while the board is idle would take them out
+of the step; a cycle's worth for `fms` local modular does not fit in its RAM.
 
-The short-circuit also decides *whether a scalar multiplication happens at all*:
-if every cell of the row's enabled set is `g_zero`, `row_decrypt` returns 0 with
-no elliptic-curve work. So a decryption is charged **only when a row answers
-"enabled"** — which is the fact §4.7 turns into a 2.7–4.6× speedup, and the fact
-that made the reduced family look slow before it.
+The earlier code instead set every inactive cell to one global constant
+`g_zero`, recognised by `memcmp`, and skipped those cells in the sums — a row of
+dozens of cells summed one or two, and a row whose cells were all `g_zero` cost
+no decryption at all. The optimisation and the leak were the same mechanism:
+the short-circuit was fast *because* an inactive cell was recognisable, and the
+cells that were not `g_zero` contracted to the active one within a few steps.
+That fast mode is gone from the single-board sketch.
 
-This is a genuine security/performance trade: byte-identical zeros are exactly
-what channel 2 in §7 exploits. The optimisation and the leak are the same
-mechanism — the short-circuit is fast *because* an inactive cell is recognisable
-by a `memcmp`. Closing the channel means re-randomising every cell after every
-transition, which removes this optimisation entirely along with its speedup.
-
-### 4.4 Fused row-sum and decrypt
+### 4.4 Row sum and decrypt
 
 Decryption is `M = c2 − priv·c1`. With `g_neg_priv = N − priv` precomputed, that
-becomes `M = c2 + (N−priv)·c1` — a multiply-add, which mbedTLS does in one call:
+becomes `M = c2 + (N−priv)·c1` — a multiply and an add:
 
 ```c
 mbedtls_ecp_mul  (ns, g_neg_priv, s1, drbg);   // blinded (§2.5)
@@ -455,8 +445,18 @@ supervisor were the only single-core ones.)
 
 ### 4.6 Measured: what actually limits performance
 
-ESP32-S3, Arduino core 3.3.12 for `fms` and 3.3.8 for the two small factories,
-every run `PASS`:
+The current code is not measured yet. The static model (§4.8), calibrated on
+the `fms` run with re-randomization, predicts per cycle 1 408 zero tests and
+8 028 encryptions of zero for `fms` local modular (~29.5 s per step, ~3.9 s
+without drawing the encryptions of zero) and 1 188 and 870 for reduced (~4.7 s,
+~1.9 s). With every cell re-randomized, runtime is **encryptions of zero ×
+140 ms** first, decryptions second.
+
+The measurements below are from the earlier code — fast mode, decisions kept —
+on an ESP32-S3, Arduino core 3.3.12 for `fms` and 3.3.8 for the two small
+factories, every run `PASS`. The same code with every cell re-randomized
+measured 27.5 s per step on `fms` local modular (553 decryptions) and 3.87 s on
+reduced (481), 1.90 s and 1.10 s without drawing the encryptions of zero.
 
 | problem | family | avg/step | decryptions | ms per decryption |
 |---|---|---|---|---|
@@ -473,9 +473,9 @@ A single scalar multiplication measures **69 ms**. Every ms-per-decryption figur
 lands between 68.6 and 80.9, across traces of 4 to 44 steps and 1 to 7
 supervisors.
 
-**Runtime is `decryptions × scalar_mul`.** Everything else the firmware does is
-noise, so the only software lever is reducing the *count* of decryptions. That is
-what §4.1 and §4.7 do, and it is why §4.5 achieves comparatively little.
+**In fast mode, runtime was `decryptions × scalar_mul`.** Everything else the
+firmware did was noise, so the only software lever was the *count* of
+decryptions — which is what the removed optimisations reduced.
 
 **Optimisation 5 buys 11–24 % on steps with several decryptions, not 2×** (§4.5).
 The cost per decryption above varies mainly with the width of the row sums, not
@@ -493,71 +493,29 @@ against ~91 ms on the WROOM-32 is a newer MPI peripheral, not hardware ECC.
 The hardware lever is therefore the **ESP32-C6** (ECC unit, acceleration enabled
 out of the box, Wi-Fi available for the UDP transport), not the S3.
 
-### 4.7 Optimisation 6 — share identical row sums
+### 4.7 Equal rows are decided once
 
-`row_decrypt` depends only on the set `S = { i : row[i] ≠ 0 and enc[i] ≠ g_zero }`:
-it takes the smallest element of `S`, adds the rest, and decrypts. Addition is
-commutative, so **two rows with the same `S` have the same result**, including
-the same `did_decrypt`.
+Two controllable events of the same supervisor whose rows of the enable matrix
+are equal have the same sum, so `load_supervisors()` groups them, from the table
+alone, and each group is summed and decrypted once per step.
 
-That matters because `S` collapses. Once the non-zero mask has contracted to the
-active cell — which happens within a few steps (§4.8) — *every* row covering that
-cell has `S = {active}`. The original code ran the same 69 ms scalar
-multiplication once per row.
-
-Phase 1 now groups enqueued rows by `S` and emits one work unit per distinct set;
-phase 2 decrypts each once; a new phase 2b fans each result out. The grouping key
-is, for every cell in the non-zero list, whether the row covers it — which is
-exactly membership of `S`, not an approximation.
-
-| `fms` (core 3.3.8) | before | after | gain |
-|---|---|---|---|
-| local modular | 916.6 ms/step, 576 dec. | 335.4 ms, 190 dec. | 2.7× |
-| reduced | 1 078.8 ms/step, 745 dec. | 233.9 ms, 145 dec. | 4.6× |
-
-**This also resolved an anomaly.** Before optimisation 6 the reduced family was
-*slower* than the full one, the opposite of what reduction promises. The cause:
-a decryption is charged only when a row answers "enabled", because the
-short-circuit is free only on "disabled". Reduction packs the same control
-information into fewer states, so its rows are much denser (mean `|A|/n` 41.9 %
-against 17.1 %) and answer "enabled" far more often (79.4 % of enqueued rows
-against 60.1 %). Each of those paid separately for what was the same ciphertext.
-Removing that redundancy helps the reduced family most, and the expected ordering
-is restored: **reduced is now the fastest family on all three problems**, roughly
-2× faster than local modular.
-
-**Verification.** A static model of `row_decrypt`, written independently and
-before the change, predicted 190 and 145 decryptions. The hardware produced 190
-and 145, matching **step by step** across all 44 steps of both families, with the
-homomorphic output equal to the cleartext oracle throughout.
-
-**Security.** No new information is read: the grouping uses only the `is_g_zero`
-test optimisation 3 already performs. Timing leaks slightly *less* than before,
-since step duration now tracks the number of distinct sums rather than the number
-of "enabled" answers. But the honest framing is that the speedup is **borrowed
-from the leak in §7**: in a genuinely oblivious implementation, where no
-ciphertext is recognisably zero, `S` would equal the full enabled set for every
-row, sharing would essentially never occur, and this optimisation would gain
-nothing.
+The earlier code grouped rows by their set of cells that were *not* `g_zero`,
+which collapsed to the active cell within a few steps, so most rows shared one
+decryption: on `fms` (core 3.3.8) it brought local modular from 576 to 190
+decryptions per cycle (916.6 → 335.4 ms/step) and reduced from 745 to 145
+(1 078.8 → 233.9 ms/step). That gain was borrowed from the leak of §4.3: with
+every cell fresh, only rows that are equal in the table can share a sum.
 
 ### 4.8 A static cost model that matches the hardware exactly
 
-The model that predicted those counts simulates two things the firmware
-distinguishes and the plaintext automaton does not:
-
-- `plain[s]` — the true one-hot state, which decides the *answer*;
-- `nonzero[s]` — whether cell `s` is byte-distinct from `g_zero`, which decides
-  whether a scalar multiplication *happens*.
-
-It also documents an easily-missed property: the encrypted state vector is **not
-one-hot at the ciphertext level**. The set of cells byte-distinct from `g_zero`
-is an over-approximation of the reachable state — it begins as *every* cell,
-because `init_states()` encrypts each one freshly, and contracts under the
-transition image. For `fms` local modular it goes 327 → 7 cells over the run;
-for reduced, 37 → 7, and more slowly in relative terms.
-
-That contraction is the same structure channel 2 in §7 exploits, and §4.7 is what
-turns it into a performance consequence as well as a security one.
+The number of encryptions of zero and of decryptions does not depend on the
+keys or the randomness, only on the trace, so a plaintext simulation of the
+supervisors counts them. Written independently of the firmware, the model
+matched the earlier code on the board exactly: 190 and 145 decryptions in fast
+mode, step by step, and 8 028 / 870 encryptions of zero with 553 / 481
+decryptions with every cell re-randomized. For the current code it counts, per
+step, the cells of the supervisors that move and the distinct controllable rows
+of all supervisors; §4.6 gives its predictions.
 
 ---
 
@@ -760,11 +718,12 @@ problem, node count, supervisor family, transport and driver — and, after a mi
 that only surfaced on real hardware, every `.cpp` in each sketch folder as the
 Arduino IDE itself compiles it, not just the `.ino`.
 
-**Prediction before measurement.** Optimisation 6 was specified, its effect
-predicted by an independent static model, and only then implemented. The model
-said 190 and 145 decryptions; the hardware said 190 and 145, step by step. A
-model that reproduces the hardware to the unit is stronger evidence than a test
-suite written after the fact.
+**Prediction before measurement.** The sharing of row sums of the earlier code
+was specified, its effect predicted by an independent static model, and only
+then implemented. The model said 190 and 145 decryptions; the hardware said 190
+and 145, step by step. A model that reproduces the hardware to the unit is
+stronger evidence than a test suite written after the fact; the same model
+gives the expected counts of the current code (§4.6).
 
 ---
 
@@ -781,12 +740,14 @@ power analysis of the decryption scalar multiplication.
 | # | Channel | Status |
 |---|---|---|
 | 1 | Timing/power on the private scalar | **Closed** by default via scalar blinding [5]; see [6][7] on why blinding alone is not sufficient without a regular ladder |
-| 2 | `g_zero` byte-equality — inactive cells are byte-identical | **Open by design.** Closing it costs ~2 scalar multiplications per cell per transition (~138 ms each on this hardware) and removes optimisations 3 *and* 6 — i.e. most of the measured speed |
-| 3 | Active-ciphertext propagation — the active cell's bytes are copied unchanged across transitions | **Open by design.** Same mitigation, same cost |
-| 4 | **Decision leakage** — the enablement bits are, by construction, revealed | Inherent. This is what opacity theory [8] analyses |
-| 5 | **Traffic analysis** (distributed only) — frames are fixed-size, but the timing and existence of shared-event transactions are visible | Open; link encryption plus cover traffic would be the next step |
+| 2 | Byte-equality — inactive cells identical to one fixed `Enc(0)` | **Closed** on one board and in `des_split`: every cell gets a fresh `Enc(0)` after every transition (~140 ms per cell, §4.3). **Open** in the distributed engine |
+| 3 | Active-ciphertext propagation — the active cell's bytes copied unchanged | **Closed** the same way; **open** in the distributed engine |
+| 4 | **Decisions kept in RAM** between steps | **Closed** on one board and in `des_split` (recomputed every step, §4.1); **open** in the distributed engine |
+| 5 | **Decision leakage** — the enablement bits are, by construction, revealed to the plant | Inherent. This is what opacity theory [8] analyses |
+| 6 | **Key and events on the board that holds the state** | **Open** on one board; `des_split` keeps both on the plant's board, and the supervisor's board never learns the event |
+| 7 | **Traffic analysis** (distributed and `des_split`) — frames are fixed-size, but the timing of steps is visible | Open; cover traffic would be the next step |
 
-Channels 4 and 5 are the ones a reviewer is most likely to press on, and neither
+Channels 5 and 7 are the ones a reviewer is most likely to press on, and neither
 is addressed by the encryption. They are properties of the architecture, not
 implementation defects.
 
@@ -794,7 +755,8 @@ implementation defects.
 
 - **No formal verification.** Correctness rests on testing and on the structural
   arguments above, not on a machine-checked proof.
-- **Performance is bounded by the platform**, not the algorithm (§4.6).
+- **Performance is bounded by the platform**, not the algorithm (§4.6); fresh
+  encryptions of zero dominate it.
 - **Hardware results are from one board, one run each.** The ESP32-S3 figures in
   §4.6–4.8 cover all three problems and every supervisor family, but each is a
   single execution with no variance reported.

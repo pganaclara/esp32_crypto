@@ -5,11 +5,13 @@
 // Runs a Discrete Event System supervisor on an ESP32 with the plant state
 // held only as EC-ElGamal ciphertexts. Each step:
 //
-//   1. apply the fired event's transitions to the encrypted state vector
-//   2. homomorphically OR each constraining row's enabled cells
-//   3. decrypt only the resulting bit (one per row) to produce enablement
+//   1. apply the fired event's transitions to the encrypted state vector and
+//      add a fresh encryption of zero to every cell of the supervisors that moved
+//   2. homomorphically OR the enabled cells of every controllable event's row
+//   3. decrypt only the resulting bit (one per distinct row) to get enablement
 //
-// The state distribution itself is never decrypted on the normal run path.
+// The state is never decrypted, and no decision is kept from one step to the
+// next.
 //
 // ── HOW TO RUN ───────────────────────────────────────────────────────────────
 //   1. Drop  supervisor_data_<PROBLEM>.h  into this folder
@@ -31,11 +33,12 @@
 //   a per-core DRBG callback, closing the timing/power side-channel on the
 //   private key. Measured cost is below 1 % on the ESP32-S3 hardware-MPI path.
 //
-//   With SECURE_MODE 0 (fast mode), two memory side-channels remain open by
-//   design: inactive cells are byte-identical to the global Enc(0) constant,
-//   and the active cell's bytes are copied unchanged across transitions. Both
-//   need RAM read access. SECURE_MODE 1, the default here, closes them, at a
-//   cost — see below and the security section of README.md.
+//   After every transition, each cell of the supervisor that moved gets a fresh
+//   encryption of zero, so every cell always carries fresh randomness: a memory
+//   snapshot shows neither the active state nor, compared with an earlier one,
+//   where it moved. Nothing decrypted is stored: the decisions are recomputed
+//   at every step and only returned. The private key, however, is on this same
+//   board; des_split/ keeps it, the events and the decisions on the plant's.
 //
 // Tested with Arduino ESP32 core v3.x on ESP32-WROOM-32 and ESP32-S3.
 // =============================================================================
@@ -44,32 +47,28 @@
 //
 // A step (he_step) runs in three phases:
 //
-//   PHASE 1 (main core, serial) — apply transitions & build work list
+//   PHASE 1 (main core, serial) — transitions
 //     For each supervisor whose trans_event_mask contains this event:
-//       a. do_transition() updates the encrypted state vector AND the
-//          persistent decompressed-point cache in lock-step.
-//       b. enqueue rows whose cached enablement could plausibly flip. The
-//          conditional-invariance lists (precomputed at load time) make this
-//          O(small) instead of "every row of every supervisor".
+//       a. do_transition() moves the cells (the image of the state set) and
+//          the persistent decompressed-point cache in lock-step;
+//       b. rerandomize() adds a fresh encryption of zero to every cell.
 //
 //   PHASE 2 (both cores, parallel) — decrypt the work units
-//     dispatch_parallel splits the work list in half. The main core handles
-//     the first half; a persistent worker task on core 0 (woken by semaphore)
-//     handles the other. Both call row_decrypt(). The list holds one entry per
-//     DISTINCT row sum, not per row — see optimisation 6.
+//     One unit per DISTINCT controllable row of EVERY supervisor: no value is
+//     kept from the previous step. dispatch_parallel splits the list in half;
+//     the main core handles the first half, a persistent worker task on core 0
+//     (woken by semaphore) the other. Both call row_decrypt().
 //
 //   PHASE 3 (main core, serial) — emit en_out
-//     Walk every supervisor's cached_en[] and produce the global enable bitmap.
+//     An event is disabled iff some unit covering it decrypted to 0.
 //
-// Six optimisations stack to bring this down from the naive ~33 s/step:
+// Four optimisations, none of which depends on the state or on a decision:
 //
-//   1. Conditional invariance  — only re-decrypt rows that can actually flip
-//   2. Persistent decompressed cache — never run pt_decompress in the hot path
-//   3. Skip Enc(0) summands    — most cells are the literal g_zero constant
-//   4. Fused row-sum + decrypt — single mbedtls_ecp_muladd does both
-//   5. Dual-core work-unit split — phase 2 splits cleanly across both cores
-//   6. Share identical row sums — rows covering the same non-zero cells have
-//      the same sum, so they are decrypted once and the result fanned out
+//   1. Persistent decompressed cache — never run pt_decompress in the hot path
+//   2. Rows of uncontrollable events are not computed: they are never disabled
+//   3. Equal rows are summed and decrypted once; a row with no enabled state is
+//      decided from the table
+//   4. Dual-core work-unit split — phase 2 splits cleanly across both cores
 // =============================================================================
 
 #include <Arduino.h>
@@ -103,18 +102,8 @@
 
 // ── Security ────────────────────────────────────────────────────────────────
 //
-// SECURE_MODE 0 (fast): inactive cells become the literal Enc(0) and the active
-// cell is copied unchanged. Optimisations 3 and 6 exploit exactly this, and it
-// lets anyone who can read RAM find the active state once the vector contracts.
-// SECURE_MODE 1: after every transition, each cell of the supervisor that moved
-// gets a fresh encryption of zero added, so every cell always carries fresh
-// randomness and the state is hidden (semantic security). Optimisation 3 then
-// never fires, and 6 only merges rows that are identical in the public table.
 // Generating the encryptions of zero is timed apart from adding them: a pool
 // precomputed offline would take the generation out of the step.
-#ifndef SECURE_MODE
-#define SECURE_MODE 1
-#endif
 //
 // Scalar blinding on decrypt is always on. mbedtls_ecp_mul is called with a
 // DRBG callback so the timing/power profile of the scalar mul does not leak
@@ -129,31 +118,27 @@
 
 struct Ciphertext { uint8_t c1[PT_LEN]; uint8_t c2[PT_LEN]; };
 
-struct Supervisor {
-    const SupDesc* desc;
-    uint32_t       own_event_mask    = 0;            // events this sv constrains or transitions
-    uint32_t       trans_event_mask  = 0;            // events this sv actually transitions on
+static_assert(EVENT_COUNT <= 32, "the event masks are 32-bit");
 
-    std::vector<uint8_t>           constrained_gi;   // global indices of constraining events
-    std::vector<Ciphertext>        enc;             // compressed state vector
-    std::vector<mbedtls_ecp_point> dec_c1, dec_c2;  // decompressed mirror of enc[]
-    std::vector<int8_t>            cached_en;       // last decrypted value per constrained row
-
-    // Conditional invariance: for each event ev,
-    //   changes_if_zero[ev] : rows that may flip 0→1 under this event
-    //   changes_if_one [ev] : rows that may flip 1→0 under this event
-    // Rows in neither list are truly invariant and keep their cached value.
-    std::vector<std::vector<uint8_t>> changes_if_zero;
-    std::vector<std::vector<uint8_t>> changes_if_one;
+// The controllable events of one supervisor whose rows of the enable matrix are
+// equal: one sum and one decryption decide all of them (optimisation 3).
+struct RowGroup {
+    uint32_t events;      // bit gi: event gi has this row
+    uint8_t  rep;         // one of them, whose row is summed
+    bool     any;         // the row has an enabled state (else: disabled, no sum)
 };
 
-// One decrypt task. `li` is a REPRESENTATIVE constrained row: every row of the
-// same supervisor whose homomorphic sum has identical summands shares this unit
-// and reuses `out` (see optimisation 6 in he_step).
-struct WorkUnit { uint8_t sv; uint8_t li; int8_t out; };
+struct Supervisor {
+    const SupDesc* desc;
+    uint32_t       trans_event_mask  = 0;            // events this sv transitions on
 
-// Maps one enqueued row back to the unit whose result it takes.
-struct RowRef { uint8_t sv; uint8_t li; uint16_t unit; };
+    std::vector<RowGroup>          groups;           // rows of its controllable events
+    std::vector<Ciphertext>        enc;             // compressed state vector
+    std::vector<mbedtls_ecp_point> dec_c1, dec_c2;  // decompressed mirror of enc[]
+};
+
+// One decrypt task: group `grp` of supervisor `sv`.
+struct WorkUnit { uint8_t sv; uint8_t grp; int8_t out; };
 
 struct WorkerCmd {
     int start, end;
@@ -176,13 +161,13 @@ static mbedtls_entropy_context  g_entropy;
 // concurrently.
 static mbedtls_ctr_drbg_context g_drbg_core0;
 static mbedtls_entropy_context  g_entropy_core0;
-static Ciphertext               g_zero;                 // canonical Enc(0) literal
 static bool                     g_dual_core = false;
 static int                      g_step_decrypts = 0;
 static portMUX_TYPE             g_dec_mux = portMUX_INITIALIZER_UNLOCKED;
-static uint64_t                 g_gen_us  = 0;           // SECURE_MODE: generating Enc(0)
-static uint64_t                 g_add_us  = 0;           // SECURE_MODE: adding them in
-static uint32_t                 g_rr_cells = 0;          // SECURE_MODE: cells re-randomized
+static uint64_t                 g_gen_us  = 0;           // generating Enc(0)
+static uint64_t                 g_add_us  = 0;           // adding them in
+static uint32_t                 g_rr_cells = 0;          // cells re-randomized
+static uint32_t                 g_ctrl = 0;              // bit gi: event gi controllable
 
 // IPC for the persistent worker on core 0
 static WorkerCmd          g_wcmd;
@@ -197,8 +182,18 @@ inline int8_t   pm_i8 (const int8_t*   a, int i) { return (int8_t) pgm_read_byte
 inline int16_t  pm_i16(const int16_t*  a, int i) { return (int16_t)pgm_read_word(a+i); }
 inline uint16_t pm_u16(const uint16_t* a, int i) { return (uint16_t)pgm_read_word(a+i); }
 
-static inline bool is_g_zero(const Ciphertext& c) {
-    return memcmp(&c, &g_zero, sizeof(Ciphertext)) == 0;
+// The header does not say which events are controllable; the event labels do,
+// with the convention of the generators (as in des_distributed and des_split):
+// 'a…' controllable, 'b…' not, otherwise an odd trailing digit is controllable.
+static bool derive_controllable(int gi) {
+    char nm[16];
+    strncpy_P(nm, (const char*)pgm_read_ptr(&EVENT_NAMES[gi]), 15);
+    nm[15] = 0;
+    if (nm[0] == 'a') return true;
+    if (nm[0] == 'b') return false;
+    int last = -1;
+    for (int i = 0; nm[i]; ++i) if (nm[i] >= '0' && nm[i] <= '9') last = nm[i] - '0';
+    return last >= 0 ? (last & 1) != 0 : true;
 }
 
 // Offset (in (from,to) pairs) of event `ev`'s transitions in desc->trans.
@@ -329,24 +324,21 @@ done:
 }
 
 // =============================================================================
-// Hot path: fused row-sum + decrypt
+// Hot path: row sum + decrypt
 // =============================================================================
 
-// Computes (homomorphically OR'd over enabled non-zero cells of sv.enc) then
-// decrypts the result, all on the persistent decompressed cache so no point
+// Homomorphically ORs ALL the enabled cells of the row, whatever they encrypt,
+// then decrypts the sum, all on the persistent decompressed cache so no point
 // decompression happens here. Returns:
 //   *out         : 0 or 1
-//   *did_decrypt : false if the row sum was trivially Enc(0), true otherwise
+//   *did_decrypt : false if the row has no enabled state (decided by the table)
 static int row_decrypt(const Supervisor& sv, const int8_t* row, int n,
                        int* out, bool* did_decrypt) {
     *did_decrypt = false;
 
     int first = -1;
-    for (int i = 0; i < n; ++i) {
-        if (!pm_i8(row, i))           continue;
-        if (is_g_zero(sv.enc[i]))     continue;
-        first = i; break;
-    }
+    for (int i = 0; i < n; ++i)
+        if (pm_i8(row, i)) { first = i; break; }
     if (first < 0) { *out = 0; return 0; }
 
     mbedtls_ecp_point s1, s2, tmp;
@@ -359,7 +351,6 @@ static int row_decrypt(const Supervisor& sv, const int8_t* row, int n,
 
     for (int i = first + 1; i < n; ++i) {
         if (!pm_i8(row, i))           continue;
-        if (is_g_zero(sv.enc[i]))     continue;
 
         ret = mbedtls_ecp_muladd(&g_grp, &tmp, &g_one, &s1, &g_one, &sv.dec_c1[i]);
         if (ret) goto done;
@@ -399,12 +390,15 @@ done:
 }
 
 // Apply event ev_gi's transitions to sv. Updates both the compressed
-// ciphertext array and the persistent decompressed cache in lock-step.
+// ciphertext array and the persistent decompressed cache in lock-step. A cell
+// that no state reaches is left empty — the point at infinity in the cache —
+// and rerandomize() then makes it a fresh encryption of zero.
 static void do_transition(Supervisor& sv, int ev_gi, int n) {
     int      off = trans_offset(sv.desc, ev_gi);
     uint16_t pc  = pm_u16(sv.desc->tcnt, ev_gi);
 
-    std::vector<Ciphertext>        nxt(n, g_zero);
+    std::vector<Ciphertext>        nxt(n);
+    std::vector<uint8_t>           filled(n, 0);
     std::vector<mbedtls_ecp_point> nxt_c1(n), nxt_c2(n);
     for (int i = 0; i < n; ++i) {
         mbedtls_ecp_point_init(&nxt_c1[i]);
@@ -418,18 +412,13 @@ static void do_transition(Supervisor& sv, int ev_gi, int n) {
     // emitted last win, so an INACTIVE source silently overwrites an ACTIVE one.
     // The result then depends on the order the pairs happen to sit in the .h,
     // which is not stable across regenerations (supervisor reduction relabels
-    // states freely).
-    //
-    // Skipping zero sources makes the common path correct at no cost: a cell
-    // holding the literal Enc(0) contributes nothing to a union, so it can never
-    // clobber an active cell. If two ACTIVE sources ever converge — impossible
-    // for a one-hot state vector, but not worth assuming — they are combined
-    // with the additive homomorphism, which is the same OR used everywhere else.
+    // states freely). Converging sources are therefore combined with the
+    // additive homomorphism, which is the same OR used everywhere else.
     for (uint16_t p = 0; p < pc; ++p) {
         int from = pm_i16(sv.desc->trans + off * 2, p * 2);
         int to   = pm_i16(sv.desc->trans + off * 2, p * 2 + 1);
-        if (is_g_zero(sv.enc[from])) continue;          // contributes nothing
-        if (is_g_zero(nxt[to])) {
+        if (!filled[to]) {
+            filled[to] = 1;
             nxt[to] = sv.enc[from];
             // Deep-copy the already-decompressed point — far cheaper than
             // re-running pt_decompress on the target cell.
@@ -457,12 +446,11 @@ static void do_transition(Supervisor& sv, int ev_gi, int n) {
     sv.dec_c2 = std::move(nxt_c2);
 }
 
-#if SECURE_MODE
 // Add a fresh encryption of zero, (rG, rY), to every cell of sv. The plaintexts
-// do not change; every cell gets new randomness. A cell the transition set to
-// the literal Enc(0) has the point at infinity as its decompressed mirror, which
-// mbedTLS refuses to add, so it simply becomes (rG, rY). Returns an mbedTLS
-// error code; a failure is reported, never skipped silently.
+// do not change; every cell gets new randomness. A cell the transition left
+// empty has the point at infinity as its decompressed mirror, which mbedTLS
+// refuses to add, so it simply becomes (rG, rY). Returns an mbedTLS error code;
+// a failure is reported, never skipped silently.
 static int rerandomize(Supervisor& sv, int n) {
     mbedtls_mpi r;
     mbedtls_ecp_point z1, z2, s;
@@ -495,7 +483,6 @@ static int rerandomize(Supervisor& sv, int n) {
     mbedtls_ecp_point_free(&z1); mbedtls_ecp_point_free(&z2); mbedtls_ecp_point_free(&s);
     return ret;
 }
-#endif
 
 // =============================================================================
 // Parallel decrypt engine
@@ -516,13 +503,12 @@ static void process_work_range(int start, int end,
         WorkUnit& w = work[wi];
         Supervisor& sv = g_sups[w.sv];
         int n  = (int)pgm_read_word(&sv.desc->num_states);
-        int gi = sv.constrained_gi[w.li];
+        int gi = sv.groups[w.grp].rep;
 
         int e = 0; bool did_decrypt = false;
         if (row_decrypt(sv, sv.desc->enable + gi * n, n, &e, &did_decrypt) != 0) continue;
         if (did_decrypt) (*dec_count)++;
-        // Result goes to the unit, not straight to a row: he_step fans it out
-        // to every row that shares these summands.
+        // he_step applies the result to every event of the group.
         w.out = (int8_t)e;
     }
 }
@@ -578,99 +564,48 @@ static void dispatch_parallel(std::vector<WorkUnit>& work) {
 static int he_step(int ev_gi, std::vector<int>& en_out) {
     en_out.assign(EVENT_COUNT, 1);
 
-    // Phase 1 (main core, serial): apply transitions, build work list. A row
-    // is enqueued only if its current cached value could actually flip.
-    //
-    // OPTIMISATION 6 — share identical row sums.
-    // row_decrypt sums the cells of a row that are not the literal g_zero, so a
-    // row's homomorphic sum is determined entirely by which NON-ZERO cells it
-    // covers — not by the row itself. Once the non-zero set has contracted to
-    // the active cell (which it does within a few steps), EVERY row that covers
-    // that cell has the SAME sum, and the old code ran the same 69 ms scalar
-    // multiplication once per row. Rows are therefore grouped here by their
-    // summand set; each distinct set is decrypted once and the result fanned
-    // out. Nothing new is revealed: this reuses a value the code already
-    // computes, via the same is_g_zero test it already performs.
-    static std::vector<WorkUnit> work;
-    static std::vector<RowRef>   refs;
-    static std::vector<uint16_t> nz;        // cells that are not the g_zero literal
-    static std::vector<uint8_t>  queued;    // rows enqueued for the current sv
-    work.clear();
-    refs.clear();
-
+    // Phase 1 (main core, serial): the supervisors that move on this event
+    // apply its transitions and get a fresh encryption of zero in every cell.
     for (size_t i = 0; i < g_sups.size(); ++i) {
         Supervisor& sv = g_sups[i];
-        if (!(sv.trans_event_mask & (1u << ev_gi))) continue;     // cached values still valid
+        if (!(sv.trans_event_mask & (1u << ev_gi))) continue;
         int n = (int)pgm_read_word(&sv.desc->num_states);
         do_transition(sv, ev_gi, n);
-#if SECURE_MODE
         if (int err = rerandomize(sv, n)) return err;
-#endif
-
-        queued.clear();
-        for (uint8_t li : sv.changes_if_zero[ev_gi])
-            if (sv.cached_en[li] == 0) queued.push_back(li);
-        for (uint8_t li : sv.changes_if_one[ev_gi])
-            if (sv.cached_en[li] == 1) queued.push_back(li);
-        if (queued.empty()) continue;
-
-        nz.clear();
-        for (int s = 0; s < n; ++s)
-            if (!is_g_zero(sv.enc[s])) nz.push_back((uint16_t)s);
-
-        const size_t base = work.size();          // units belonging to this sv
-        for (uint8_t li : queued) {
-            const int8_t* row = sv.desc->enable + sv.constrained_gi[li] * n;
-
-            int unit = -1;
-            for (size_t k = base; k < work.size(); ++k) {
-                const int8_t* other =
-                    sv.desc->enable + sv.constrained_gi[work[k].li] * n;
-                bool same = true;
-                for (uint16_t idx : nz)
-                    if ((pm_i8(row, idx) != 0) != (pm_i8(other, idx) != 0)) { same = false; break; }
-                if (same) { unit = (int)k; break; }
-            }
-            if (unit < 0) {
-                work.push_back({(uint8_t)i, li, -1});
-                unit = (int)work.size() - 1;
-            }
-            refs.push_back({(uint8_t)i, li, (uint16_t)unit});
-        }
     }
 
-    // Phase 2: parallel decrypt across both cores — one pass per DISTINCT sum.
+    // Phase 2: one unit per distinct controllable row of EVERY supervisor —
+    // nothing is kept from the previous step, so the supervisors that did not
+    // move are decided again too. A row with no enabled state needs no sum.
+    static std::vector<WorkUnit> work;
+    work.clear();
+    for (size_t i = 0; i < g_sups.size(); ++i)
+        for (size_t k = 0; k < g_sups[i].groups.size(); ++k)
+            if (g_sups[i].groups[k].any) work.push_back({(uint8_t)i, (uint8_t)k, -1});
     dispatch_parallel(work);
+    for (const WorkUnit& w : work)
+        if (w.out < 0) return -1;                  // row_decrypt failed
 
-    // Phase 2b: fan each unit's result out to every row that shares it. A unit
-    // left at -1 means row_decrypt failed; that row keeps its cached value.
-    for (const RowRef& r : refs) {
-        int8_t out = work[r.unit].out;
-        if (out >= 0) g_sups[r.sv].cached_en[r.li] = out;
-    }
-
-    // Phase 3: emit en_out from cached_en.
+    // Phase 3: an event is disabled iff some group that covers it is 0.
+    for (const WorkUnit& w : work)
+        if (w.out == 0)
+            for (int gi = 0; gi < EVENT_COUNT; ++gi)
+                if (g_sups[w.sv].groups[w.grp].events & (1u << gi)) en_out[gi] = 0;
     for (auto& sv : g_sups)
-        for (size_t li = 0; li < sv.constrained_gi.size(); ++li)
-            if (!sv.cached_en[li]) en_out[sv.constrained_gi[li]] = 0;
-
+        for (const RowGroup& g : sv.groups)
+            if (!g.any)
+                for (int gi = 0; gi < EVENT_COUNT; ++gi)
+                    if (g.events & (1u << gi)) en_out[gi] = 0;
     return 0;
 }
 
 // =============================================================================
-// Supervisor loading and invariance precomputation
+// Supervisor loading
 // =============================================================================
 //
-// One-time setup per benchmark. Reads the SupDesc descriptors from PROGMEM,
-// populates the runtime Supervisor structs, and precomputes the conditional-
-// invariance lists used by he_step to skip rows whose values can't possibly
-// have changed.
-//
-// The conditional-invariance precomputation is the densest piece of code in
-// this file. It answers, for every (supervisor, event, row) triple, the
-// question: "if this supervisor receives this event, can this row's
-// homomorphic OR-sum flip 0→1 or 1→0?"  See comments inside the inner loops
-// for the precise condition.
+// One-time setup per benchmark. Reads the SupDesc descriptors from PROGMEM and
+// groups, per supervisor, the controllable events whose rows of the enable
+// matrix are equal. Only the tables are used: nothing here depends on the state.
 
 static bool load_supervisors(const SupDesc* descs, int count) {
     g_sups.clear();
@@ -681,85 +616,38 @@ static bool load_supervisors(const SupDesc* descs, int count) {
         sv.desc = &descs[i];
         int n = (int)pgm_read_word(&descs[i].num_states);
 
-        // Build event masks and the constrained_gi list.
+        int rows = 0;
         for (int gi = 0; gi < EVENT_COUNT; ++gi) {
-            if (pm_u16(descs[i].tcnt, gi) > 0) {
-                sv.own_event_mask   |= (1u << gi);
-                sv.trans_event_mask |= (1u << gi);
+            if (pm_u16(descs[i].tcnt, gi) > 0) sv.trans_event_mask |= (1u << gi);
+            if (!(g_ctrl & (1u << gi))) continue;      // uncontrollable: never disabled
+            const int8_t* row = descs[i].enable + gi * n;
+            bool zero = false, one = false;
+            for (int s = 0; s < n; ++s) (pm_i8(row, s) ? one : zero) = true;
+            if (!zero) continue;                       // enabled in every state
+            ++rows;
+            bool merged = false;
+            for (RowGroup& g : sv.groups) {
+                const int8_t* other = descs[i].enable + g.rep * n;
+                bool same = true;
+                for (int s = 0; s < n && same; ++s)
+                    same = (pm_i8(row, s) != 0) == (pm_i8(other, s) != 0);
+                if (same) { g.events |= (1u << gi); merged = true; break; }
             }
-            bool constrains = false;
-            for (int s = 0; s < n && !constrains; ++s)
-                if (!pm_i8(descs[i].enable, gi * n + s)) constrains = true;
-            if (constrains) {
-                sv.own_event_mask |= (1u << gi);
-                sv.constrained_gi.push_back((uint8_t)gi);
-            }
-        }
-        sv.cached_en.assign(sv.constrained_gi.size(), 1);
-        sv.changes_if_zero.assign(EVENT_COUNT, {});
-        sv.changes_if_one .assign(EVENT_COUNT, {});
-
-        // Precompute the conditional-invariance lists per event.
-        //
-        // For row gi of this supervisor under event ev:
-        //   0 → 1 flip is possible iff some (f,t) has en_f=0 AND en_t=1
-        //                              (i.e. an outside state moves into A)
-        //   1 → 0 flip is possible iff some enabled state has no transition,
-        //                              or transitions to an outside state
-        for (int ev = 0; ev < EVENT_COUNT; ++ev) {
-            uint16_t pc = pm_u16(descs[i].tcnt, ev);
-            if (pc == 0) continue;
-            int off = trans_offset(&descs[i], ev);
-
-            std::vector<uint8_t> in_from (n, 0);
-            std::vector<int16_t> trans_to(n, -1);
-            for (int p = 0; p < pc; ++p) {
-                int f = pm_i16(descs[i].trans + off * 2, p * 2);
-                int t = pm_i16(descs[i].trans + off * 2, p * 2 + 1);
-                in_from[f]  = 1;
-                trans_to[f] = (int16_t)t;
-            }
-
-            for (int li = 0; li < (int)sv.constrained_gi.size(); ++li) {
-                int gi = sv.constrained_gi[li];
-                const int8_t* row = descs[i].enable + gi * n;
-
-                // Rows with no enabled state are permanently 0.
-                bool any_en = false;
-                for (int s = 0; s < n && !any_en; ++s)
-                    if (pm_i8(row, s)) any_en = true;
-                if (!any_en) { sv.cached_en[li] = 0; continue; }
-
-                bool zero_to_one = false;
-                for (int p = 0; p < pc && !zero_to_one; ++p) {
-                    int f = pm_i16(descs[i].trans + off * 2, p * 2);
-                    int t = pm_i16(descs[i].trans + off * 2, p * 2 + 1);
-                    if (!pm_i8(row, f) && pm_i8(row, t)) zero_to_one = true;
-                }
-                if (zero_to_one) sv.changes_if_zero[ev].push_back((uint8_t)li);
-
-                bool one_to_zero = false;
-                for (int s = 0; s < n && !one_to_zero; ++s) {
-                    if (!pm_i8(row, s)) continue;
-                    if (!in_from[s])              { one_to_zero = true; break; }
-                    if (!pm_i8(row, trans_to[s])) { one_to_zero = true; break; }
-                }
-                if (one_to_zero) sv.changes_if_one[ev].push_back((uint8_t)li);
-            }
+            if (!merged) sv.groups.push_back({1u << gi, (uint8_t)gi, one});
         }
 
         char name[16];
         strncpy_P(name, (const char*)pgm_read_ptr(&descs[i].name), 15);
         name[15] = 0;
-        Serial.printf("[LOAD] %-14s  %3d states  %2d constraining ev  (%u bytes enc)\n",
-                      name, n, (int)sv.constrained_gi.size(),
+        Serial.printf("[LOAD] %-14s  %3d states  %2d controllable rows, %2d distinct"
+                      "  (%u bytes enc)\n", name, n, rows, (int)sv.groups.size(),
                       (unsigned)(n * sizeof(Ciphertext)));
     }
     return true;
 }
 
 // =============================================================================
-// Initial encryption and cache warm-up
+// Initial encryption
 // =============================================================================
 
 static bool init_states() {
@@ -800,20 +688,6 @@ static bool init_states() {
     return true;
 }
 
-// Compute initial cached_en for every (sv, row) by running the parallel engine.
-// No sharing is possible here: before the first transition every cell is a
-// fresh encryption, so no cell equals the g_zero literal and every row has a
-// distinct summand set. One unit per row.
-static void warm_cache() {
-    std::vector<WorkUnit> work;
-    for (size_t i = 0; i < g_sups.size(); ++i)
-        for (size_t li = 0; li < g_sups[i].constrained_gi.size(); ++li)
-            work.push_back({(uint8_t)i, (uint8_t)li, -1});
-    dispatch_parallel(work);
-    for (const WorkUnit& w : work)
-        if (w.out >= 0) g_sups[w.sv].cached_en[w.li] = w.out;
-}
-
 // =============================================================================
 // Oracle — cleartext reference for verification
 // =============================================================================
@@ -852,10 +726,9 @@ struct Oracle {
                 st[i] = nxt;
             }
 
-            // Emit constraints
-            if (!g_sups[i].own_event_mask) continue;
+            // Emit constraints: controllable events only, like the homomorphic path
             for (int gi = 0; gi < EVENT_COUNT; ++gi) {
-                if (!(g_sups[i].own_event_mask & (1u << gi))) continue;
+                if (!(g_ctrl & (1u << gi))) continue;
                 bool constrains = false;
                 for (int s = 0; s < n && !constrains; ++s)
                     if (!pm_i8(descs[i].enable, gi * n + s)) constrains = true;
@@ -937,11 +810,6 @@ static void run_benchmark(const char* label, const SupDesc* descs, int count) {
     Serial.println();
     if (!init_states())  { Serial.println("[FATAL] Encryption failed."); while(true) delay(1000); }
 
-    Serial.print("Warming enablement cache... ");
-    long tw = millis();
-    warm_cache();
-    Serial.printf("OK (%ld ms)\n\n", millis() - tw);
-
     Oracle oracle; oracle.init(descs, count);
     uint64_t total_us = 0, min_us = UINT64_MAX, max_us = 0;
     int  total_dec = 0;
@@ -975,9 +843,8 @@ static void run_benchmark(const char* label, const SupDesc* descs, int count) {
         Serial.print("  [HE]     "); print_vec(he_en);     Serial.println();
         Serial.printf("  Time: %.3f ms  |  Decrypts: %d  |  %s\n",
                       step_us / 1000.0, g_step_decrypts, ok ? "OK" : "FAIL");
-        if (SECURE_MODE)
-            Serial.printf("  Re-randomization: generating Enc(0) %.3f ms, adding %.3f ms\n",
-                          (g_gen_us - gen0) / 1000.0, (g_add_us - add0) / 1000.0);
+        Serial.printf("  Re-randomization: generating Enc(0) %.3f ms, adding %.3f ms\n",
+                      (g_gen_us - gen0) / 1000.0, (g_add_us - add0) / 1000.0);
         Serial.println();
     }
 
@@ -988,15 +855,13 @@ static void run_benchmark(const char* label, const SupDesc* descs, int count) {
                   min_us / 1000.0, max_us / 1000.0);
     Serial.printf("  Total decrypts: %d | Supervisors: %d | Result: %s\n",
                   total_dec, count, all_ok ? "PASS" : "FAIL");
-    if (SECURE_MODE) {
-        Serial.printf("  Secure mode: %u cells re-randomized; generating Enc(0) %.3f ms "
-                      "(%.3f ms each), adding %.3f ms\n", (unsigned)g_rr_cells,
-                      g_gen_us / 1000.0, g_rr_cells ? g_gen_us / 1000.0 / g_rr_cells : 0.0,
-                      g_add_us / 1000.0);
-        Serial.printf("  With Enc(0) precomputed offline: Total %.3f ms | Avg %.3f ms\n",
-                      (total_us - g_gen_us) / 1000.0,
-                      ((total_us - g_gen_us) / (double)ns) / 1000.0);
-    }
+    Serial.printf("  %u cells re-randomized; generating Enc(0) %.3f ms "
+                  "(%.3f ms each), adding %.3f ms\n", (unsigned)g_rr_cells,
+                  g_gen_us / 1000.0, g_rr_cells ? g_gen_us / 1000.0 / g_rr_cells : 0.0,
+                  g_add_us / 1000.0);
+    Serial.printf("  With Enc(0) precomputed offline: Total %.3f ms | Avg %.3f ms\n",
+                  (total_us - g_gen_us) / 1000.0,
+                  ((total_us - g_gen_us) / (double)ns) / 1000.0);
     Serial.println("============================================\n");
 
     for (auto& sv : g_sups) { sv_free_dec(sv); sv.enc.clear(); }
@@ -1027,7 +892,6 @@ static void crypto_init() {
     mbedtls_ecp_gen_keypair(&g_grp, &g_priv, &g_pub,
                              mbedtls_ctr_drbg_random, &g_drbg);
     mbedtls_mpi_sub_mpi(&g_neg_priv, &g_grp.N, &g_priv);   // fixed for the run
-    elgamal_enc(0, &g_zero, &g_drbg);
 
     // Seed the worker core's DRBG with a different personalisation string so
     // the two cores' RNG streams are independent.
@@ -1086,10 +950,12 @@ void setup() {
     Serial.printf("  EVENT_COUNT : %d\n",      EVENT_COUNT);
     Serial.printf("  SIM_SEQ_LEN : %d\n",      SIM_SEQ_LEN);
     Serial.printf("  Ciphertext  : %u bytes\n", (unsigned)sizeof(Ciphertext));
-    Serial.printf("  Security    : scalar blinding, %s mode\n\n",
-                  SECURE_MODE ? "SECURE (fresh randomness in every cell)" : "fast");
+    Serial.printf("  Security    : scalar blinding, fresh randomness in every cell,"
+                  " no decision kept\n\n");
 
     crypto_init();
+    for (int gi = 0; gi < EVENT_COUNT; ++gi)
+        if (derive_controllable(gi)) g_ctrl |= (1u << gi);
 
     g_dual_core = spawn_worker();
     Serial.printf("[Dual-core] %s\n\n",

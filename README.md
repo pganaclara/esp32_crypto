@@ -25,6 +25,16 @@ homomorphic-esp32-ultrades/
 ├── supervisor_data_small_factory.h         generated supervisor data
 ├── supervisor_data_extended_small_factory.h
 ├── supervisor_data_fms.h
+├── supervisor_data_cluster_tool_2.h        (also _3)
+│
+├── des_split/                              SUPERVISOR + PLANT on two boards
+│   ├── des_split.ino                         ESP32 entry point (header, role)
+│   ├── des_split.h                           both roles; the key, the events and the
+│   │                                         decisions stay on the plant board
+│   ├── host_main.cpp                         POSIX entry point (mock group without mbedTLS)
+│   ├── README.md                             protocol and how to run
+│   └── des_transport.h, secrets.example.h,   hard links
+│       supervisor_data_cluster_tool_*.h
 │
 ├── des_distributed/                        DISTRIBUTED engine (its own sketch)
 │   ├── des_distributed.ino                   ESP32 entry point (config only)
@@ -54,6 +64,7 @@ to match the sketch name), which is why the generated headers live at the top.
         ▼
   supervisor_data_<PROBLEM>.h          PROGMEM arrays, no runtime parsing
         ├──────────────► homomorphic-esp32-ultrades.ino   one board, all supervisors
+        ├──────────────► des_split/                       supervisor board + plant board
         └──────────────► des_distributed/                 N boards, one partition each
 ```
 
@@ -74,6 +85,10 @@ to match the sketch name), which is why the generated headers live at the top.
    `DES_NODE_ID` and `DES_NUM_NODES` in `des_distributed.ino`, and flash each
    board with a different `DES_NODE_ID`. See
    [`des_distributed/README.md`](des_distributed/README.md).
+4. **Supervisor and plant on two boards.** Copy `des_distributed/secrets.h` into
+   `des_split/`, pick the header in `des_split.ino`, and flash one board with
+   `DES_ROLE DES_PLANT` and the other with `DES_SUPERVISOR`. See
+   [`des_split/README.md`](des_split/README.md).
 
 ---
 
@@ -84,6 +99,7 @@ to match the sketch name), which is why the generated headers live at the top.
 | `small_factory` | 4 | 1 | two machines, one-slot buffer; monolithic 6 states |
 | `extended_small_factory` | 6 | 2 | three machines, two buffers; monolithic 18 states; only `a2`/`b2` are shared |
 | `fms` (Queiroz & Cury 2000) | 31 | 7 | eight machines; E7 and E8 composed as `E78 = E7 ∥ E8` to resolve their conflict; largest supervisor 164 states; monolithic too large for flash, omitted |
+| `cluster_tool_2`, `_3` (PlanningDES) | 14, 22 | 2 | linear cluster tool with 2 or 3 clusters; one supervisor per specification conflicts, so E1 stays alone and the others are composed (10 + 18, 10 + 167 states); monolithic 45 and 419 states. `cluster_tool_4` (30 events, monolithic 4 184 states) is in the notebook but does not fit in RAM |
 
 ---
 
@@ -106,25 +122,30 @@ state vector is 1 iff the active state is in the enabled set, which is exactly
 the supervisor's question. The runtime path only adds points; scalar
 multiplications happen at setup (encryption) and in each row's final decryption.
 
-**Transition.** The next state set is the image of the current one:
+**Transition.** The next state set is the image of the current one, and then
+every cell gets a fresh encryption of zero:
 
 ```
-nxt[t] = ⋃ { enc[f] : (f,t) is a transition on ev }      nxt[s] = Enc(0) otherwise
+nxt[t] = ⋃ { enc[f] : (f,t) is a transition on ev }      (empty if none)
+enc[s] = nxt[s] + Enc(0)    for every cell s, with fresh randomness
 ```
 
-Sources holding the literal `Enc(0)` are skipped, so the common case is one
-ciphertext copy per pair; converging active sources are combined homomorphically.
+Converging sources are combined homomorphically. Adding a fresh `Enc(0)` keeps
+the bit and changes the randomness, so every stored cell is a fresh ciphertext
+and a memory snapshot does not show the active state.
 
-**Optimisations**, from ~33 s (naive) to ~1 s on the heavy steps:
+**Decisions.** At every step, one homomorphic sum per distinct row of the
+controllable events of every supervisor, decrypted to one bit. Nothing is kept
+from one step to the next: no decision is stored on the board.
+
+**Optimisations** — none depends on the state or on a decision:
 
 | # | optimisation | what it does |
 |---|---|---|
-| 1 | Conditional invariance | Precompute, per `(sup, event, row)`, whether the row can flip; re-decrypt only rows that can. |
-| 2 | Persistent decompressed cache | Keep every cell as an `mbedtls_ecp_point` so the hot path never runs a modular square root. |
-| 3 | Skip-`g_zero` summands | Inactive cells equal the global `Enc(0)` and are skipped — rows sum 1–2 cells instead of dozens. |
-| 4 | Fused row-sum + decrypt | One `mbedtls_ecp_muladd` does the secret scalar mul and the final add. |
-| 5 | Dual-core split | Work units split across both cores (sketches with two or more supervisors). Steps that decrypt several sums get 11–24 % faster; steps with one decryption gain nothing. |
-| 6 | Share identical row sums | Rows are grouped by their set of non-`Enc(0)` cells; each set is decrypted once. 2.7–4.6× on `fms`. |
+| 1 | Persistent decompressed cache | Keep every cell as an `mbedtls_ecp_point` so the hot path never runs a modular square root. |
+| 2 | Uncontrollable rows dropped | A supervisor never disables an uncontrollable event, so its row is not computed. |
+| 3 | Equal rows once | Controllable events of a supervisor with equal rows share one sum and one decryption; a row with no enabled state is decided from the table. |
+| 4 | Dual-core split | Work units split across both cores. |
 
 ---
 
@@ -160,10 +181,35 @@ Protocol, transport analysis and the two-board results:
 
 ## Benchmark results
 
+**The sketch as it is now has not been run yet.** Since it dropped the fast mode
+and the decisions kept between steps, every step re-randomizes the supervisors
+that move and decides every distinct controllable row again. The static model,
+which matched the board exactly on the earlier code (8 028 encryptions of zero
+and 553 zero tests for `fms`), predicts per cycle, with times calibrated on the
+`fms` run (140 ms per encryption of zero, 55 ms per zero test on both cores,
+8 ms per addition) — estimates, to be measured:
+
+| problem | family | zero tests | Enc(0) | per step (est.) | without drawing Enc(0) |
+|---|---|---|---|---|---|
+| `small_factory` | monolithic | 8 | 24 | ~1.0 s | ~0.1 s |
+| `extended_small_factory` | local modular | 24 | 48 | ~1.4 s | ~0.2 s |
+| `fms` | local modular | 1 408 | 8 028 | ~29.5 s | ~3.9 s |
+| | reduced | 1 188 | 870 | ~4.7 s | ~1.9 s |
+| `cluster_tool_2` | monolithic | 196 | 1 260 | ~6.9 s | ~0.6 s |
+| | local modular | 280 | 592 | ~3.6 s | ~0.7 s |
+| `cluster_tool_3` | local modular | 616 | 6 840 | ~24.1 s | ~2.4 s |
+| | reduced | 572 | 3 048 | ~11.6 s | ~1.9 s |
+
+### Earlier measurements (code up to commit `a67a4c3`)
+
 Single board, **ESP32-S3** @ 240 MHz, Arduino core 3.3.12 for `fms` (3.3.8 for
-the two small factories), secp192r1, scalar blinding on, fast mode
-(`SECURE_MODE 0`; the sketch ships with 1, see [Security notes](#security-notes)). All nine runs `PASS`: every homomorphic enablement vector matched the
-cleartext oracle at every step. Measured `scalar_mul` = 69 ms, `muladd` = 5 ms.
+the two small factories), secp192r1, scalar blinding on. That code kept the
+decisions between steps (re-decrypting only the rows that could change) and had
+a fast mode that reused one fixed encryption of zero; both are gone. All runs
+`PASS`: every homomorphic enablement vector matched the cleartext oracle at every
+step. Measured `scalar_mul` = 69 ms, `muladd` = 5 ms.
+
+Fast mode:
 
 | problem | family | sups | ciphertext | warm-up | avg/step | min | max | decryptions |
 |---|---|---|---|---|---|---|---|---|
@@ -177,20 +223,26 @@ cleartext oracle at every step. Measured `scalar_mul` = 69 ms, `muladd` = 5 ms.
 | 44 steps | local modular | 7 | 16 350 B | 12 828 ms | 346.0 ms | 75.8 | 1 467.7 | 190 |
 | | **reduced** | 7 | **1 850 B** | 5 160 ms | **241.1 ms** | 0.21 | 955.0 | **145** |
 
-* **Runtime is decryptions × scalar multiplication.** Time per decryption ranges
-  68.6–80.9 ms across the runs, against 69 ms for one scalar multiplication;
-  steps needing no decryption cost ~0.2 ms. The only software lever left is the
-  number of decryptions.
-* **Reduced is the fastest family** on all three problems, 1.4–2.1× faster than
-  local modular.
-* **Monolithic is not slower per step; it is infeasible at scale.** On
-  `extended_small_factory` it needs fewer decryptions than local modular (7 vs 8),
-  but the `fms` monolithic supervisor does not fit in flash. Local-modular
-  decomposition is what makes `fms`, and distribution, possible.
+With a fresh encryption of zero in every cell (the secure mode, `fms`, core
+3.3.12, oracle `PASS`):
+
+| `fms` | avg/step | decryptions | without drawing Enc(0) |
+|---|---|---|---|
+| local modular | 27.5 s | 553 | 1.90 s |
+| reduced | 3.87 s | 481 | 1.10 s |
+
+Generating the encryptions of zero (two scalar multiplications, 140 ms each) was
+93 % and 71 % of that time; a cycle's worth for local modular (8 028 of them)
+exceeds the board's free memory, so the last column is a subtraction, not a run
+with a pool.
+
 * **The ESP32-S3 has no ECC accelerator** (`SOC_ECC_SUPPORTED` is off; it has
   RSA/MPI, AES and SHA). The ESP32-C6 and ESP32-H2 have one, and the core's
   prebuilt mbedTLS enables `CONFIG_MBEDTLS_HARDWARE_ECC` for them; the H2 has no
   Wi-Fi.
+* **Monolithic is infeasible at scale**: the `fms` monolithic supervisor does not
+  fit in flash. Local-modular decomposition is what makes `fms`, and
+  distribution, possible.
 
 ---
 
@@ -202,26 +254,15 @@ entropy); the firmware is research-grade.
 | # | channel | status | if exploited |
 |---|---|---|---|
 | 1 | Timing / power on the private scalar | **Closed** — every scalar mul is blinded | private-key recovery |
-| 2 | Inactive cells are byte-identical to the global `Enc(0)` | **Closed** by `SECURE_MODE 1`; open in fast mode | reveals the active state after each transition |
-| 3 | The active cell's bytes are copied unchanged | **Closed** by `SECURE_MODE 1`; open in fast mode | fingerprints the state trajectory |
+| 2 | Inactive cells byte-identical to one fixed `Enc(0)` | **Closed** — every cell gets a fresh `Enc(0)` after every transition | reveals the active state |
+| 3 | The active cell's bytes copied unchanged | **Closed** — same | fingerprints the state trajectory |
+| 4 | Decisions kept in RAM between steps | **Closed** — recomputed at every step, never stored | narrows down the state |
+| 5 | Private key on the same board as the state | **Open** on one board; [`des_split/`](des_split/README.md) keeps it on the plant's board | decrypts everything |
+| 6 | Events processed in clear | **Open** on one board; `des_split/` never sends them to the supervisor's board | replaying them gives the state |
 
-Channels 2 and 3 need RAM access and are the price of optimisations 3 and 6: they
-are fast *because* inactive cells equal `g_zero`. `SECURE_MODE 1`, the sketch's
-default, closes them: after every transition each cell of the supervisor that
-moved gets a fresh encryption of zero, so a memory snapshot no longer shows the
-state (a process reading memory continuously could still see the randomness).
-Measured on `fms`, core 3.3.12, oracle `PASS`:
-
-| `fms` | fast mode | secure mode | secure, Enc(0) precomputed |
-|---|---|---|---|
-| local modular | 346.0 ms, 190 dec. | 27.5 s, 553 dec. | 1.90 s |
-| reduced | 241.1 ms, 145 dec. | 3.87 s, 481 dec. | 1.10 s |
-
-Generating the encryptions of zero (two scalar multiplications, 140 ms each) is
-93 % and 71 % of the secure time; the last column leaves it out, but one cycle's
-worth for local modular (8 028 of them) exceeds the board's free memory. The
-decryption counts are the static model's predictions. The distributed engine
-has only the fast mode.
+A process reading memory continuously could still see the randomness and the
+event as they are processed. `des_distributed/` still reuses one fixed `Enc(0)`
+and keeps the decisions: channels 2–4 are open there.
 
 In the distributed engine, frames are authenticated but not encrypted: the state
 stays encrypted, but the timing of shared events is visible on the wire.
@@ -240,18 +281,23 @@ stays encrypted, but the timing of shared events is visible on the wire.
 | 6b | validate `sim_seq` against the supervisors; optionally synthesise a valid one |
 | 7 | emit `supervisor_data_<PROBLEM>.h` as PROGMEM C arrays; the monolithic supervisor is omitted above 1.2 MB (`HAS_MONO`) |
 
-The header does not record controllability. The distributed engine needs it
-(vote vs notify), infers it from the event labels and prints what it inferred at
-boot; override with `DES_CONTROLLABLE_MASK`.
+The header does not record controllability. The sketches infer it from the
+event labels ('a…' controllable, 'b…' not, otherwise an odd trailing digit is
+controllable): the single board to drop the rows of uncontrollable events, the
+distributed engine to choose vote or notify (it prints what it inferred at boot;
+override with `DES_CONTROLLABLE_MASK`).
 
 ---
 
 ## Verification
 
-* **Single board:** compiles with `-Wall -Wextra` and zero warnings against all
-  three headers; nine runs on an ESP32-S3, all `PASS` (one run each, no variance
-  reported). An independently written cost model predicted optimisation 6's
-  190 / 145 decryptions before the change; the hardware matched step by step.
+* **Single board:** compiles with zero warnings (`--warnings all`); the current
+  code is not yet run. The earlier code ran nine times on an ESP32-S3, all
+  `PASS`, and its decryption and re-randomization counts matched the static
+  model exactly.
+* **Supervisor and plant on two boards:** both roles compile with zero warnings
+  for the ESP32-S3; on a Linux host (mock group) the 2- and 3-cluster tools pass
+  every step, also with 20 % of the frames dropped. Not yet run on the boards.
 * **Distributed:** two ESP32-S3 boards run `fms` for 5 cycles — 220/220 steps,
   0 skipped, oracle `PASS` on both, 100 + 397 decryptions as predicted. The
   engine also runs on Linux (`host_main.cpp`) under injected loss, reboots and
