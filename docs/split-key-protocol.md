@@ -9,7 +9,9 @@ Version 5 (the pipeline of §10, re-randomized decision sums, one identity key
 per board, §9) takes 2.06 s per step on P-256 on the boards. Version 6 (the
 audit of §12) passed every step on the boards, in 2058.1 ms per step on P-256
 on average over three runs (2110.4, 2038.1 and 2025.7 ms), and the audit of a
-recorded board run found no deviation.
+recorded board run found no deviation. On the 3-cluster tool (419 states, with
+PSRAM) it passed all 44 steps in 10855.6 ms per step, with the same cost per
+operation, and needs 240.9 s between events.
 For the paper after the ACC one; no deadline yet.
 
 ## 1. Goal
@@ -251,9 +253,8 @@ and the work are unchanged, only their order in time.
 
 ## 11. What to measure
 
-1. The 3-cluster tool on boards with PSRAM.
-2. Frames and resends per step against the counts above.
-3. The 4-cluster tool on boards with PSRAM, for a few steps.
+1. Frames and resends per step against the counts above.
+2. The 4-cluster tool on boards with PSRAM, for a few steps.
 
 ## 12. Audit: S is accountable
 

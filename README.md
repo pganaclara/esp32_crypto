@@ -306,8 +306,9 @@ override with `DES_CONTROLLABLE_MASK`).
   (mock group) the 2- and 3-cluster tools pass every step, also with 20 % of
   the frames dropped, and `audit.py` audits the recorded run. On two ESP32-S3
   boards, version 6 passed every step of the 2-cluster tool on P-256 in every
-  run, in 2058.1 ms per step on average over three runs, and the audit of a
-  recorded run found no deviation. Details in
+  run, in 2058.1 ms per step on average over three runs, and every step of the
+  3-cluster tool (419 states, with PSRAM) in 10855.6 ms; the audits of recorded
+  runs found no deviation. Details in
   [des_split/README.md](des_split/README.md).
 * **Distributed:** the current engine (protocol version 7, fresh randomness,
   no decision kept) compiles with zero warnings and passes every problem on

@@ -182,7 +182,7 @@ apart.
    | header | states | events | note |
    |---|---|---|---|
    | `supervisor_data_cluster_tool_2.h` | 45 | 14 | |
-   | `supervisor_data_cluster_tool_3.h` | 419 | 22 | the supervisor board needs ~190 KB of heap on P-256 |
+   | `supervisor_data_cluster_tool_3.h` | 419 | 22 | needs PSRAM (Tools → PSRAM → OPI PSRAM on ESP32-S3-N16R8 modules): without it the supervisor board aborts when it allocates its 972 candidates, 124 KB at once |
    | `supervisor_data_cluster_tool_4.h` | 4184 | 30 | needs PSRAM on both boards (Tools → PSRAM → OPI PSRAM): ~1.6 MB on the plant, ~2.2 MB on the supervisor on P-256 |
 
 3. Open both Serial Monitors, then RESET both boards.
@@ -194,6 +194,32 @@ new state (of it, encryptions of zero drawn on the spot: 0 with the pool),
 waiting for the decisions, and the zero tests, which overlap with the
 supervisor's work. The summary gives the means, and how long each board needs
 between two events.
+
+## On the boards
+
+Two ESP32-S3-N16R8 boards, P-256, the current version (split key, hidden
+logic, the two boards at the same time, the audit); every decision of every
+run matched the supervisor in clear:
+
+| | 2-cluster tool | 3-cluster tool |
+|---|---|---|
+| states, candidates, decision rows | 45, 74, 7 | 419, 972, 11 |
+| step, mean | 2058.1 ms (3 runs) | 10855.6 ms (sd 583.8, 10375–13215) |
+| re-randomize and send the new state | 795 ms | 7399 ms |
+| waiting for the decisions | 351 ms | 1622 ms |
+| zero tests | 869 ms | 1366 ms |
+| supervisor, between events | 19.7 s | 240.9 s |
+| plant, between events | 10.2 s | 95.3 s |
+| encrypting the initial state | 10.3 s | 95.6 s |
+
+Every operation costs the same in both: 17.7 ms to re-randomize and send a
+cell, 124 ms per zero test, about 245 ms per item the supervisor prepares. The
+step grows with the number of states, the time between events with the number
+of transitions. The 3-cluster run, made while a laptop recorded it on the same
+channel, was audited from 8105 frames: no deviation, 8 of its 45 steps checked
+in part for frames the recording lacked. For the 4-cluster tool (4184 states,
+12 630 candidates) the same costs give about 52 min between events and 1.8 min
+per step, so about 54 h for its 60 steps (an estimate).
 
 ## Test on a host
 
