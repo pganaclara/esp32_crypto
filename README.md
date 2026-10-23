@@ -25,15 +25,17 @@ homomorphic-esp32-ultrades/
 ├── supervisor_data_small_factory.h         generated supervisor data
 ├── supervisor_data_extended_small_factory.h
 ├── supervisor_data_fms.h
-├── supervisor_data_cluster_tool_2.h        (also _3)
+├── supervisor_data_cluster_tool_2.h        (also _3, _4)
 │
 ├── des_split/                              SUPERVISOR + PLANT on two boards
 │   ├── des_split.ino                         ESP32 entry point (header, role)
-│   ├── des_split.h                           both roles; the key, the events and the
-│   │                                         decisions stay on the plant board
+│   ├── des_split.h                           both roles; the key is split between the
+│   │                                         boards, the events stay on the plant's
 │   ├── host_main.cpp                         POSIX entry point (mock group without mbedTLS)
 │   ├── README.md                             protocol and how to run
-│   └── des_transport.h, secrets.example.h,   hard links
+│   ├── make_keys.py                          one identity key per board, for secrets.h
+│   ├── audit.py                              records a run and checks the supervisor's signed steps
+│   └── des_transport.h, secrets.example.h,   copies
 │       supervisor_data_cluster_tool_*.h
 │
 ├── des_distributed/                        DISTRIBUTED engine (its own sketch)
@@ -260,7 +262,7 @@ entropy); the firmware is research-grade.
 | 2 | Inactive cells byte-identical to one fixed `Enc(0)` | **Closed** — every cell gets a fresh `Enc(0)` after every transition | reveals the active state |
 | 3 | The active cell's bytes copied unchanged | **Closed** — same | fingerprints the state trajectory |
 | 4 | Decisions kept in RAM between steps | **Closed** — recomputed at every step, never stored | narrows down the state |
-| 5 | Private key on the same board as the state | **Open** on one board; [`des_split/`](des_split/README.md) keeps it on the plant's board | decrypts everything |
+| 5 | Private key on the same board as the state | **Open** on one board; [`des_split/`](des_split/README.md) splits it between the two boards, so neither can decrypt alone | decrypts everything |
 | 6 | Events processed in clear | **Open** on one board; `des_split/` never sends them to the supervisor's board | replaying them gives the state |
 
 A process reading memory continuously could still see the randomness and the
@@ -300,8 +302,13 @@ override with `DES_CONTROLLABLE_MASK`).
   `PASS`, and its decryption and re-randomization counts matched the static
   model exactly.
 * **Supervisor and plant on two boards:** both roles compile with zero warnings
-  for the ESP32-S3; on a Linux host (mock group) the 2- and 3-cluster tools pass
-  every step, also with 20 % of the frames dropped. Not yet run on the boards.
+  for the ESP32-S3 (with PSRAM for the 3- and 4-cluster tools); on a Linux host
+  (mock group) the 2- and 3-cluster tools pass every step, also with 20 % of
+  the frames dropped, and `audit.py` audits the recorded run. On two ESP32-S3
+  boards, version 6 passed every step of the 2-cluster tool on P-256 in every
+  run, in 2058.1 ms per step on average over three runs, and the audit of a
+  recorded run found no deviation. Details in
+  [des_split/README.md](des_split/README.md).
 * **Distributed:** the current engine (protocol version 7, fresh randomness,
   no decision kept) compiles with zero warnings and passes every problem on
   Linux with a test double for the cryptography, also under 30 % frame loss;

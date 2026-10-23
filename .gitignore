@@ -4,3 +4,9 @@ secrets.h
 
 # Local Claude Code settings (per-machine permissions).
 .claude/settings.local.json
+
+# Python bytecode of des_split/audit.py and make_keys.py.
+__pycache__/
+
+# Network recordings of des_split runs (audit.py record).
+des_split/*.bin

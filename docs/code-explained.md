@@ -32,7 +32,7 @@ author lists could not be confirmed are marked as such rather than guessed.
 | `homomorphic-esp32-ultrades.ino` | the homomorphic core, single board |
 | `des_distributed/des_generic.h` | the same core, plus partitioning and the protocol |
 | `des_distributed/des_transport.h` | how frames get to the other nodes |
-| `des_split/des_split.h` | supervisor and plant on two boards: the key, the events and the decisions stay on the plant's |
+| `des_split/des_split.h` | supervisor and plant on two boards: the key is split between them; the events and the decisions stay on the plant's |
 | `notebook/generator_ultrades.ipynb` | where the data comes from |
 
 The single-board sketch and the distributed engine share the same cryptographic
@@ -745,7 +745,7 @@ power analysis of the decryption scalar multiplication.
 | 3 | Active-ciphertext propagation — the active cell's bytes copied unchanged | **Closed** the same way |
 | 4 | **Decisions kept in RAM** between steps | **Closed** in every sketch: computed when needed (§4.1), never stored |
 | 5 | **Decision leakage** — the enablement bits are, by construction, revealed to the plant | Inherent. This is what opacity theory [8] analyses |
-| 6 | **Key and events on the board that holds the state** | **Open** on one board; `des_split` keeps both on the plant's board, and the supervisor's board never learns the event |
+| 6 | **Key and events on the board that holds the state** | **Open** on one board; `des_split` splits the key between the boards and keeps the events on the plant's, so the supervisor's board never learns the event |
 | 7 | **Traffic analysis** (distributed and `des_split`) — frames are fixed-size, but the timing of steps is visible | Open; cover traffic would be the next step |
 
 Channels 5 and 7 are the ones a reviewer is most likely to press on, and neither
