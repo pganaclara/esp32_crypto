@@ -1182,6 +1182,31 @@ static void handle(const Frame& f) {
     }
 }
 
+// The same supervisor unencrypted on this board: its move and its decisions
+// along the whole trace, from the tables in flash, repeated so that the
+// microseconds of a step can be measured. The baseline of the encrypted step.
+static void bench_clear(int q0) {
+    const int R = 100;
+    uint32_t steps = 0, allowed = 0;               // allowed: keeps every decision computed
+    uint64_t t0 = des_micros();
+    for (int r = 0; r < R; ++r) {
+        int q = q0;
+        for (int k = 0; k < SIM_SEQ_LEN; ++k) {
+            int e = pm_u16(SIM_SEQ, k), to = -1;
+            for (int p = 0; p < tcnt(e); ++p) if (tfrom(e, p) == q) { to = tto(e, p); break; }
+            if (to < 0) return;                    // not admissible: next_step() says so
+            q = to;
+            for (int f = 0; f < EVENT_COUNT; ++f) allowed += enabled(f, q);
+            ++steps;
+        }
+        DES_YIELD();
+    }
+    uint64_t t = des_micros() - t0;
+    volatile uint32_t sink = allowed; (void)sink;
+    DES_LOG("[clear] the same supervisor unencrypted on this board: %.2f us per step"
+            " (%u steps of the trace)\n", steps ? (double)t / steps : 0.0, (unsigned)steps);
+}
+
 static void split_setup() {
     build_tables();
     cr_init("des_split_plant");
@@ -1198,6 +1223,7 @@ static void split_setup() {
     if (!DES_TRANSPORT_IMPL.begin()) { halt("network down"); return; }
     p_oracle = 0;
     for (int q = 0; q < NS; ++q) if (pm_i8(MONO_SUP.init, q)) p_oracle = q;
+    bench_clear(p_oracle);
     p_pool.assign((size_t)NS * CELL_RAW, 0);
     DES_LOG("[split] PLANT board, epoch %08x, config %08x, P-%d: %d states, %d events, "
             "%d candidate cells and %d decision sums per step\n", (unsigned)g_epoch,
