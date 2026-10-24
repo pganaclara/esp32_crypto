@@ -254,7 +254,10 @@ and the work are unchanged, only their order in time.
 ## 11. What to measure
 
 1. Frames and resends per step against the counts above.
-2. The 4-cluster tool on boards with PSRAM, for a few steps.
+2. The 4-cluster tool on boards with PSRAM, for a few steps: done, the first
+   10 steps of its trace (`des_split/README.md`, "On the boards"). There S no
+   longer keeps up with the cells of c' as they arrive, since each cell belongs
+   to 1.47 sums on average, and P waits for the decisions.
 
 ## 12. Audit: S is accountable
 

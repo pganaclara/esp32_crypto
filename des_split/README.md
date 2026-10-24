@@ -19,13 +19,13 @@ not learn which event it was. It then computes the encrypted decisions — one
 homomorphic sum per distinct row of R among the controllable events — and adds
 its part of the decryption to each; the plant finishes it with a zero test.
 
-| message | direction | frames per step, 2 / 3 clusters: P-192 | P-224 | P-256 |
+| message | direction | frames per step, 2 / 3 / 4 clusters: P-192 | P-224 | P-256 |
 |---|---|---|---|---|
 | `READY` | supervisor → plant, before the event: the candidates are ready | 1 | 1 | 1 |
 | `STEP` | plant → supervisor | 1 | 1 | 1 |
-| `CAND` | supervisor → plant: (event, label, cell) per transition | 6 / 75 | 7 / 89 | 8 / 98 |
-| `NEWST` | plant → supervisor: the re-randomized state | 4 / 30 | 4 / 35 | 5 / 42 |
-| `DECS` | supervisor → plant: (events, sum, its part of the decryption), one row per frame | 7 / 11 | 7 / 11 | 7 / 11 |
+| `CAND` | supervisor → plant: (event, label, cell) per transition | 6 / 75 / 972 | 7 / 89 / 1149 | 8 / 98 / 1263 |
+| `NEWST` | plant → supervisor: the re-randomized state | 4 / 30 / 299 | 4 / 35 / 349 | 5 / 42 / 419 |
+| `DECS` | supervisor → plant: (events, sum, its part of the decryption), one row per frame | 7 / 11 / 15 | 7 / 11 / 15 | 7 / 11 / 15 |
 
 The number of frames, the supervisor's work and the plant's work are the same
 for every event: the plant waits for all the candidates, re-randomizes all the
@@ -83,13 +83,15 @@ So the plant learns the number of states, the decisions and which labels each
 event leads to: for every event, the set of states it leads into, up to a
 renaming of the states. The renaming changes every step, but states that
 differ in the events leading into them can still be told apart: 41 of the 45
-states of the 2-cluster tool, 251 of the 419 of the 3-cluster tool. After an
+states of the 2-cluster tool, 251 of the 419 of the 3-cluster tool, 1680 of the
+4184 of the 4-cluster tool. After an
 event that leads into a single state (2 of the 14 events of the 2-cluster
-tool), the plant therefore knows the state it reached. Hiding this would take
+tool, none of the 3- and 4-cluster tools), the plant therefore knows the state
+it reached. Hiding this would take
 a candidate for every label of every event (14 × 45 = 630 per step instead of
 74); we do not pad. The three measures cost one encryption of zero and one
 addition per candidate and per row on the supervisor (81 per step for 2 clusters, 983 for
-3), all before the event. In the benchmark the plant fires the next event once
+3, 12 645 for 4), all before the event. In the benchmark the plant fires the next event once
 its pool is full and the supervisor's `READY` has come, so the step time still
 runs from the event to the decisions. A step that comes before the candidates
 are ready has the supervisor finish them on the spot.
@@ -193,7 +195,10 @@ event to the decisions, split into candidates, re-randomizing and sending the
 new state (of it, encryptions of zero drawn on the spot: 0 with the pool),
 waiting for the decisions, and the zero tests, which overlap with the
 supervisor's work. The summary gives the means, and how long each board needs
-between two events.
+between two events. At boot, before waiting for the other board, the plant
+also prints `[clear]`: the time of a step of the same supervisor unencrypted
+on that board (its move and its decisions, from the tables in flash), over the
+whole trace 100 times. It is the baseline of the encrypted step.
 
 ## On the boards
 
@@ -201,25 +206,33 @@ Two ESP32-S3-N16R8 boards, P-256, the current version (split key, hidden
 logic, the two boards at the same time, the audit); every decision of every
 run matched the supervisor in clear:
 
-| | 2-cluster tool | 3-cluster tool |
-|---|---|---|
-| states, candidates, decision rows | 45, 74, 7 | 419, 972, 11 |
-| step, mean | 2058.1 ms (3 runs) | 10855.6 ms (sd 583.8, 10375–13215) |
-| re-randomize and send the new state | 795 ms | 7399 ms |
-| waiting for the decisions | 351 ms | 1622 ms |
-| zero tests | 869 ms | 1366 ms |
-| supervisor, between events | 19.7 s | 240.9 s |
-| plant, between events | 10.2 s | 95.3 s |
-| encrypting the initial state | 10.3 s | 95.6 s |
+| | 2-cluster tool | 3-cluster tool | 4-cluster tool |
+|---|---|---|---|
+| states, candidates, decision rows | 45, 74, 7 | 419, 972, 11 | 4184, 12 630, 15 |
+| step, mean | 2058.1 ms (3 runs) | 10855.6 ms (sd 583.8, 10375–13215) | 116411.5 ms (sd 3039.9, 114444–124487; the first 10 steps) |
+| re-randomize and send the new state | 795 ms | 7399 ms | 73899 ms |
+| waiting for the decisions | 351 ms | 1622 ms | 35802 ms |
+| zero tests | 869 ms | 1366 ms | 1857 ms |
+| supervisor, between events | 19.7 s | 240.9 s | 3101.0 s |
+| plant, between events | 10.2 s | 95.3 s | 951.1 s |
+| encrypting the initial state | 10.3 s | 95.6 s | 951.2 s |
+| the same supervisor in clear (`[clear]`), per step | 0.98 µs | 2.01 µs | 10.11 µs |
 
-Every operation costs the same in both: 17.7 ms to re-randomize and send a
-cell, 124 ms per zero test, about 245 ms per item the supervisor prepares. The
-step grows with the number of states, the time between events with the number
-of transitions. The 3-cluster run, made while a laptop recorded it on the same
+Every operation costs the same in the three sizes: 17.7 ms to re-randomize and
+send a cell, 124 ms per zero test, about 245 ms per item the supervisor
+prepares. The step grows with the number of states, the time between events
+with the number of transitions: an event can be processed at full speed every
+22 s, 4.2 min and 54 min. For 4 clusters the wait for the decisions grows more:
+each cell belongs to 1.47 sums on average (0.82 for 2 clusters, 1.14 for 3),
+and the supervisor, which adds each cell to its sums as it arrives, no longer
+keeps up with the plant's 17.7 ms per cell; in that run it asked 109 times for
+lost frames, and the plant sent 7808 frames again.
+
+The 4-cluster run covered the first 10 of the 60 steps of its trace
+(`SIM_SEQ_LEN` set to 10 for the run); all 60 would take about 54 h. It was not
+recorded. The 3-cluster run, made while a laptop recorded it on the same
 channel, was audited from 8105 frames: no deviation, 8 of its 45 steps checked
-in part for frames the recording lacked. For the 4-cluster tool (4184 states,
-12 630 candidates) the same costs give about 52 min between events and 1.8 min
-per step, so about 54 h for its 60 steps (an estimate).
+in part for frames the recording lacked.
 
 ## Test on a host
 
