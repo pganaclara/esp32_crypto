@@ -3,11 +3,11 @@
 // =============================================================================
 //
 // One board is the PLANT: it emulates the plant by replaying the trace of the
-// header and decrypts the decisions. The other is the SUPERVISOR: it holds the
-// supervisor's tables and its encrypted state, and never sees an event or a
-// decision. The private key is split between the two boards, so neither can
-// decrypt anything alone. The logic is in des_split.h; this file only picks
-// the deployment and brings up the Wi-Fi.
+// header, sends each event to the SUPERVISOR and decrypts the decisions. The
+// SUPERVISOR holds the supervisor's tables and its encrypted state, which it
+// updates with each event, and never sees a decision. The private key is split
+// between the two boards, so neither can decrypt anything alone. The logic is
+// in des_split.h; this file only picks the deployment and brings up the Wi-Fi.
 //
 // ── CONFIGURE PER BOARD ──────────────────────────────────────────────────────
 // Flash one board with DES_ROLE DES_PLANT and the other with DES_SUPERVISOR,
@@ -19,7 +19,7 @@
 //   supervisor_data_cluster_tool_2.h   14 events,  45 states
 //   supervisor_data_cluster_tool_3.h   22 events, 419 states
 //   supervisor_data_cluster_tool_4.h   30 events, 4184 states: needs PSRAM on
-//                                      both boards (Tools → PSRAM → OPI PSRAM)
+//                                      the supervisor board (Tools → PSRAM → OPI PSRAM)
 #define DES_DATA_HEADER "supervisor_data_cluster_tool_2.h"
 // NIST P-192, P-224 or P-256: about 96, 112 or 128 bits of security.
 #define DES_CURVE 256

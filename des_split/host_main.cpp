@@ -165,12 +165,6 @@ static int cr_sum(const uint8_t* const* cells, int cnt, uint8_t out[CELL_RAW]) {
     put(u, out); put(v, out + PT_RAW);
     return 0;
 }
-static int cr_rerandomize(const uint8_t* cell, const uint8_t z[CELL_RAW], uint8_t out[CELL_RAW]) {
-    uint64_t u = madd(cell ? get_raw(cell) : 0, get_raw(z));
-    uint64_t v = madd(cell ? get_raw(cell + PT_RAW) : 0, get_raw(z + PT_RAW));
-    put(u, out); put(v, out + PT_RAW);
-    return 0;
-}
 static int cr_partial(const uint8_t cell[CELL_RAW], uint8_t D[PT_RAW]) {
     put(mmul(g_mnegk, get_raw(cell)), D);
     return 0;
