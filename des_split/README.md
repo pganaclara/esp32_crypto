@@ -66,11 +66,19 @@ pass for the other board.
 **The event is encrypted**, with a symmetric stream cipher for the link,
 apart from the ElGamal encryption of the state: `STEP` carries σ XOR the first
 two bytes of HMAC-SHA256(K_k, "des_split event"), and the supervisor decrypts
-it with the same two bytes. K_1 is a third session key, derived as the MAC
-keys are, and K_{k+1} = HMAC-SHA256(K_k, "des_split next"): each board moves
-on to the next key once it has used one (a hash ratchet), so neither holds the
-key of a step already done. A `STEP` sent again carries the same encrypted
-event. Nothing of the state is decrypted this way.
+it with the same two bytes. K_{k+1} = HMAC-SHA256(K_k, "des_split next"): each
+board moves on to the next key once it has used one (a hash ratchet), so
+neither holds the key of a step already done. K_1 comes from an **ephemeral
+key** of the supervisor, e_S, derived from the seed of the audit: the
+supervisor's `KEY` also carries E_S = e_S·G, and K_1 is HMAC-SHA256 under the
+x of e_S·k_P·G (e_S·Y_P on the supervisor, k_P·E_S on the plant) of
+"des_split" ‖ 3 ‖ both epochs. The supervisor erases e_S as soon as K_1 is
+made. A K_1 made from k_P·k_S·G, as the MAC keys are, could be redone by
+whoever read k_S, which stays in the supervisor's RAM all run, and with it
+every recorded event decrypted: on a host, k_S and the recording of a
+3-cluster run gave all 44 events with that K_1, and give none with this one.
+A `STEP` sent again carries the same encrypted event. Nothing of the state is
+decrypted this way.
 
 ## What each board learns
 
@@ -84,12 +92,15 @@ U). **The network** sees neither the events (encrypted) nor the state (never
 sent), only when the frames go.
 
 **Whoever reads the supervisor's memory once** finds ciphertexts of the state
-that it cannot relate to anything. The supervisor keeps the event nowhere
-after the move (only its encrypted form, for the record), erases which states it
-left and entered, erases the seed of the audit once the initial state is
-encrypted (with the seed, the initial encryption could be redone, and since
-the cells only move, every cell decrypted), and draws the encryptions of zero
-of step k from a key z_k that moves on as K does. **Whoever reads it twice**
+that it cannot relate to anything, and no key of an earlier step: the event
+of the last step, which it keeps encrypted for the record, and the `STEP`
+frames recorded until then stay encrypted, since e_S is erased. The supervisor
+keeps the event nowhere after the move, erases which states it left and
+entered, erases the seed of the audit once the initial state is encrypted
+(with the seed, the initial encryption could be redone, and since the cells
+only move, every cell decrypted), and draws the encryptions of zero of step k
+from a key z_k that moves on as K does. A read during a step, between the
+`STEP` and the move, finds the event. **Whoever reads it twice**
 sees where each cell moved in between, and so the events in between; if it
 knows the state at the first read (at boot, for instance), it knows it at the
 second. Whoever reads it once and records the network from then on can decrypt
@@ -109,8 +120,9 @@ The plant cannot check the supervisor's sums without its tables. The
 supervisor can still be held to them afterwards:
 
 * at boot it draws a secret **seed**, from which it derives all its randomness
-  (its key share, the initial encryption, the encryptions of zero of the state
-  and of the sums), and sends in its signed `KEY` the **commitment**
+  (its key share, its ephemeral key, the initial encryption, the encryptions
+  of zero of the state and of the sums), and sends in its signed `KEY` the
+  **commitment**
   SHA-256("des_split commit" ‖ seed ‖ tables);
 * both boards chain a SHA-256 over every step's event, encrypted as `STEP`
   carried it, and decisions, and after every step the supervisor **signs** the
@@ -134,7 +146,7 @@ router's 2.4 GHz and 5 GHz networks may not pass multicast to each other), and
 
 The state never travels: `check` computes it from the seed and the events (in
 the plant's `STEP` frames, which it decrypts: the seed gives the supervisor's
-share, and with the plant's share in its `KEY`, the key of the event's
+ephemeral key, and with the plant's share in its `KEY`, the key of the event's
 encryption), so a
 frame that the recording lacks costs the check of that frame only. A step
 whose `STEP` was not recorded is still checked: the event is the one whose
@@ -198,20 +210,22 @@ step.
 ## On the boards
 
 Two ESP32-S3, P-256, one run per size; every decision of every step matched
-the supervisor in clear:
+the supervisor in clear. The 2-cluster run is of this code; the 3- and
+4-cluster runs were made before the key of the events came from an ephemeral
+key, which changes the boot only:
 
 | | 2-cluster tool | 3-cluster tool | 4-cluster tool |
 |---|---|---|---|
 | states, decision rows, steps | 45, 7, 28 | 419, 11, 44 | 4184, 15, 60 |
-| step, mean (from the event to the decisions) | 1078.1 ms (1071.9–1091.5) | 1961.3 ms (1937.1–2071.0) | 6876.1 ms (6844.4–7001.2) |
-| plant: waiting for the rows | 210.1 ms | 596.4 ms | 5015.5 ms |
-| plant: zero tests | 868.0 ms (124.0 ms per row) | 1364.9 ms (124.1 ms per row) | 1860.6 ms (124.0 ms per row) |
+| step, mean (from the event to the decisions) | 1099.1 ms (1070.0–1228.0) | 1961.3 ms (1937.1–2071.0) | 6876.1 ms (6844.4–7001.2) |
+| plant: waiting for the rows | 230.5 ms | 596.4 ms | 5015.5 ms |
+| plant: zero tests | 868.7 ms (124.1 ms per row) | 1364.9 ms (124.1 ms per row) | 1860.6 ms (124.0 ms per row) |
 | supervisor: the new state (decrypting the event, moving the cells) | 0.6 ms | 5.1 ms | 50.0 ms |
-| supervisor: the rows | 931.5 ms (133.1 ms per row) | 1787.0 ms (162.5 ms per row) | 6627.6 ms (441.8 ms per row) |
+| supervisor: the rows | 933.1 ms (133.3 ms per row) | 1787.0 ms (162.5 ms per row) | 6627.6 ms (441.8 ms per row) |
 | supervisor: Enc(0) per step, drawn before the event | 7, one per row | 11, one per row | 15, one per row |
-| supervisor, between events | 1.6 s (227.3 ms per Enc(0)) | 2.5 s (227.8 ms per Enc(0)) | 3.4 s (228.0 ms per Enc(0)) |
-| from the first event to the end of the run (plant) | not measured | 194.0 s (4.41 s per event) | 614.5 s (10.24 s per event) |
-| encrypting the initial state | 10.2 s | 95.5 s | 952.8 s |
+| supervisor, between events | 1.6 s (227.5 ms per Enc(0)) | 2.5 s (227.8 ms per Enc(0)) | 3.4 s (228.0 ms per Enc(0)) |
+| from the first event to the end of the run (plant) | 73.4 s (2.62 s per event) | 194.0 s (4.41 s per event) | 614.5 s (10.24 s per event) |
+| encrypting the initial state | 10.3 s | 95.5 s | 952.8 s |
 | rows sent again | 0 | 6 (2 NACKs) | 896 (821 NACKs, see below) |
 
 A row costs the supervisor more than a zero test costs the plant (most of it
@@ -219,9 +233,15 @@ is D = −k_S U, the rest the sum), so the step is the supervisor's new state
 and rows, plus the last zero test and the link: the plant tests each row while
 the supervisor makes the next. The step grows with the rows and the size of
 their sums, the time between events with the rows only, and the encryption of
-the initial state with the number of states. In the 3-cluster run, five steps
-(2001–2071 ms) waited 60–120 ms more for their rows, with the same zero tests;
-without them the mean is 1951.5 ms. A whole 3-cluster run takes about 5 min:
+the initial state with the number of states. In the 2-cluster run, four steps
+(1166.7–1228.0 ms) waited 79–134 ms longer for their rows than the median
+step, with the same zero tests and no frame sent again; without them the mean
+is 1081.9 ms (1070.0–1101.6), as before the ephemeral key (1078.1 ms,
+1071.9–1091.5, in the run of commit `ab60d96`). In the 3-cluster run, five
+steps (2001–2071 ms) waited 50–120 ms longer for their rows than the median
+step, with the same zero tests; without them the mean is 1951.5 ms. A whole
+2-cluster run takes about 1.4 min: 10.3 s encrypting the initial state, then
+73.4 s for the 28 events. A whole 3-cluster run takes about 5 min:
 95.5 s encrypting the initial state, then 194.0 s for the 44 events (the
 plant's clock, from the first event to the end). The 4-cluster run took
 26.4 min from the plant's boot, both boards reset together: 952.8 s encrypting

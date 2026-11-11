@@ -219,12 +219,20 @@ CR_FN uint32_t cr_random32();
 CR_FN int  cr_identity(const char* my_priv, const char* my_pub, const char* peer_pub);
 CR_FN int  cr_sign(const uint8_t* msg, size_t len, uint8_t sig[SIG_BYTES]);          // as this board
 CR_FN int  cr_verify(const uint8_t* msg, size_t len, const uint8_t sig[SIG_BYTES]);  // the other's
-// After cr_join: one MAC key per direction and the key of the event's
-// encryption (g_evk), HMAC-SHA256 under the x of the shares' Diffie–Hellman k_P k_S G
-// (only the two boards can compute it) of "des_split" || 1, 2 or 3 || both
-// epochs. cr_mac signs as this board (mine) or checks the other's.
+// After cr_join: one MAC key per direction, HMAC-SHA256 under the x of the
+// shares' Diffie–Hellman k_P k_S G (only the two boards can compute it) of
+// "des_split" || 1 or 2 || both epochs, and the key of the event's encryption
+// (g_evk), the same with 3 under the x of e_S k_P G, where e_S is the
+// supervisor's ephemeral key: the supervisor passes E_S = nullptr and erases
+// e_S here, the plant passes the supervisor's E_S = e_S G. k_S stays in the
+// supervisor's RAM all run, so whoever read it could redo a key made from
+// k_P k_S G and decrypt the recorded events; e_S is gone. cr_mac signs as this
+// board (mine) or checks the other's.
 static uint8_t g_evk[32];
-CR_FN int  cr_session(uint32_t epoch_plant, uint32_t epoch_supervisor);
+CR_FN int  cr_session(uint32_t epoch_plant, uint32_t epoch_supervisor, const uint8_t* E_S);
+// The supervisor's ephemeral key e_S, derived from seed (for the audit), and
+// E = e_S G, which it sends in its KEY.
+CR_FN int  cr_ephemeral(const uint8_t seed[32], uint8_t E[PT_RAW]);
 CR_FN void cr_mac(bool mine, const uint8_t* msg, size_t len, uint8_t tag[DES_TAG_BYTES]);
 // out = HMAC-SHA256(key, label) (out may be key).
 CR_FN void cr_kdf(const uint8_t key[32], const char* label, uint8_t out[32]);
@@ -273,6 +281,7 @@ CR_FN int  cr_zero_test(const uint8_t cell[CELL_RAW], const uint8_t D[PT_RAW]);
 static mbedtls_ecp_group        g_grp;
 static mbedtls_ecp_point        g_Y;                // joint public key
 static mbedtls_mpi              g_one, g_neg_k;     // N - k_i: this board's share
+static mbedtls_mpi              g_neg_e;            // N - e_S: the supervisor's, until cr_session
 static mbedtls_ecp_point        g_Yj, g_peer_id;    // the other's share, its identity key
 static mbedtls_mpi              g_id;               // this board's identity key
 static uint8_t                  g_mac[2][32];       // the session's MAC keys: plant's, supervisor's
@@ -403,6 +412,7 @@ static int hex_in(const char* hex, uint8_t* out, size_t n) {
 static void cr_init(const char* pers) {
     mbedtls_ecp_group_init(&g_grp); mbedtls_ecp_point_init(&g_Y);
     mbedtls_mpi_init(&g_one); mbedtls_mpi_init(&g_neg_k); mbedtls_mpi_init(&g_id);
+    mbedtls_mpi_init(&g_neg_e);
     mbedtls_ecp_point_init(&g_Yj); mbedtls_ecp_point_init(&g_peer_id);
     mbedtls_ctr_drbg_init(&g_drbg); mbedtls_entropy_init(&g_entropy);
     mbedtls_mpi_lset(&g_one, 1);
@@ -438,21 +448,43 @@ static int cr_sign(const uint8_t* msg, size_t len, uint8_t sig[SIG_BYTES]) {
 static int cr_verify(const uint8_t* msg, size_t len, const uint8_t sig[SIG_BYTES]) {
     return schnorr_check(&g_peer_id, msg, len, sig);
 }
-static int cr_session(uint32_t epoch_plant, uint32_t epoch_supervisor) {
-    mbedtls_ecp_point W; mbedtls_ecp_point_init(&W);
-    uint8_t w[PT_RAW];
+static int cr_ephemeral(const uint8_t seed[32], uint8_t E[PT_RAW]) {
+    mbedtls_mpi e; mbedtls_mpi_init(&e);
+    mbedtls_ecp_point P; mbedtls_ecp_point_init(&P);
+    int ret = det_scalar(seed, "event", 0, 0, &e);
+    if (ret == 0) ret = mbedtls_ecp_mul(&g_grp, &P, &e, &g_grp.G, mbedtls_ctr_drbg_random, &g_drbg);
+    if (ret == 0) ret = pt_to_raw(&P, E);
+    if (ret == 0) ret = mbedtls_mpi_sub_mpi(&g_neg_e, &g_grp.N, &e);
+    mbedtls_mpi_free(&e);                                // only N - e_S is kept, until cr_session
+    mbedtls_ecp_point_free(&P);
+    return ret;
+}
+static int cr_session(uint32_t epoch_plant, uint32_t epoch_supervisor, const uint8_t* E_S) {
+    mbedtls_ecp_point W, X, E;
+    mbedtls_ecp_point_init(&W); mbedtls_ecp_point_init(&X); mbedtls_ecp_point_init(&E);
+    uint8_t w[PT_RAW], x[PT_RAW];
     int ret = neg_share_times(&g_Yj, &W);        // -k_i k_j G: the same x on both boards
     if (ret == 0) ret = pt_to_raw(&W, w);
+    if (E_S) {                                   // the plant: -k_P e_S G
+        if (ret == 0) ret = pt_from_raw(E_S, &E);
+        if (ret == 0) ret = mbedtls_ecp_check_pubkey(&g_grp, &E);   // not the point at infinity
+        if (ret == 0) ret = neg_share_times(&E, &X);
+    } else {                                     // the supervisor: -e_S k_P G, then e_S is erased
+        if (ret == 0) ret = mbedtls_ecp_mul(&g_grp, &X, &g_neg_e, &g_Yj, mbedtls_ctr_drbg_random, &g_drbg);
+        mbedtls_mpi_free(&g_neg_e);
+    }
+    if (ret == 0) ret = pt_to_raw(&X, x);
     uint8_t* key[3] = {g_mac[0], g_mac[1], g_evk};
+    const uint8_t* under[3] = {w, w, x};
     for (int d = 0; d < 3 && ret == 0; ++d) {
         uint8_t m[18];
         memcpy(m, "des_split", 9); m[9] = (uint8_t)(d + 1);
         memcpy(m + 10, &epoch_plant, 4); memcpy(m + 14, &epoch_supervisor, 4);
-        ret = mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), w, SC_BYTES,
+        ret = mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), under[d], SC_BYTES,
                               m, sizeof(m), key[d]);
     }
-    memset(w, 0, sizeof(w));
-    mbedtls_ecp_point_free(&W);
+    wipe(w, sizeof(w)); wipe(x, sizeof(x));
+    mbedtls_ecp_point_free(&W); mbedtls_ecp_point_free(&X); mbedtls_ecp_point_free(&E);
     return ret;
 }
 static void cr_mac(bool mine, const uint8_t* msg, size_t len, uint8_t tag[DES_TAG_BYTES]) {
@@ -737,7 +769,7 @@ static uint32_t g_cfg = 0;
 static uint32_t config_fingerprint() {
     uint32_t h = 2166136261u;
     auto mix = [&](uint32_t v) { for (int i = 0; i < 4; ++i) { h ^= (v >> (8 * i)) & 0xff; h *= 16777619u; } };
-    mix(0x5350u + 7);                               // protocol version 7: the event to the supervisor
+    mix(0x5350u + 8);                               // protocol version 8: the event key from an ephemeral key
     mix(DES_CURVE);
     mix(NS); mix(EVENT_COUNT); mix((uint32_t)g_ctrl); mix((uint32_t)(g_ctrl >> 32));
     for (int q = 0; q < NS; ++q) mix(pm_i8(MONO_SUP.init, q));
@@ -823,7 +855,7 @@ struct __attribute__((packed)) SplitHdr {
 #define SPLIT_MAGIC   0x4C505344u
 #define SPLIT_PAYLOAD (DES_FRAME_BYTES - (int)sizeof(SplitHdr) - DES_TAG_BYTES)
 #define DECS_ITEM     (8 + CELL_RAW + PT_RAW)       // event mask, sum, D = -k_S U: one per frame
-#define KEY_PAY       (KEY_MSG + 32)                // share, proof, the supervisor's commitment
+#define KEY_PAY       (KEY_MSG + 32 + PT_RAW)       // share, proof, the supervisor's commitment and E_S
 #define SIGN_PAY      (32 + SIG_BYTES)              // h_k and the supervisor's signature of it
 
 struct Frame {
@@ -837,6 +869,7 @@ struct Frame {
 static uint32_t g_epoch = 0, g_peer_epoch = 0;
 static uint8_t  g_mykey[KEY_MSG];                  // this board's KEY: share and proof
 static uint8_t  g_commit[32];                      // the supervisor's commitment; the plant's is 0
+static uint8_t  g_myeph[PT_RAW];                   // the supervisor's E_S = e_S G; the plant's is 0
 static uint32_t g_tx = 0, g_rx = 0, g_resent = 0, g_nacks = 0, g_auth_bad = 0, g_cfg_bad = 0;
 static bool     g_halt = false, g_done = false;
 static bool     g_session = false;                 // the MAC keys are set (after KEY)
@@ -940,20 +973,20 @@ static void halt(const char* why) {
 }
 
 // KEY: this board's share and its proof, and the supervisor's commitment for
-// the audit, signed with this board's identity key together with the header
-// (epochs, configuration).
+// the audit and its E_S, signed with this board's identity key together with
+// the header (epochs, configuration).
+static void my_key_pay(uint8_t out[KEY_PAY]) {
+    memcpy(out, g_mykey, KEY_MSG); memcpy(out + KEY_MSG, g_commit, 32);
+    memcpy(out + KEY_MSG + 32, g_myeph, PT_RAW);
+}
 static void send_key() {
     Frame& f = g_txf; frame_init(f, T_KEY, 0, 0, 1, 0);
-    memcpy(f.p(), g_mykey, KEY_MSG);
-    memcpy(f.p() + KEY_MSG, g_commit, 32);
+    my_key_pay(f.p());
     if (cr_sign(f.b, sizeof(SplitHdr) + KEY_PAY, f.p() + KEY_PAY)) { halt("signing failed"); return; }
     frame_send(f);
 }
 static bool key_signed(const Frame& f) {
     return cr_verify(f.b, sizeof(SplitHdr) + KEY_PAY, f.p() + KEY_PAY) == 0;
-}
-static void my_key_pay(uint8_t out[KEY_PAY]) {
-    memcpy(out, g_mykey, KEY_MSG); memcpy(out + KEY_MSG, g_commit, 32);
 }
 
 // The record of the run, for the audit. Both boards chain a SHA-256 over every
@@ -1182,7 +1215,7 @@ static void handle(const Frame& f) {
         if (h->type == T_KEY && g_peer_epoch == 0) {
             if (cr_join(DES_SUPERVISOR, f.p())) { halt("the supervisor's key share failed its check"); return; }
             g_peer_epoch = h->epoch;
-            if (cr_session(g_epoch, g_peer_epoch)) { halt("no session keys"); return; }
+            if (cr_session(g_epoch, g_peer_epoch, f.p() + KEY_MSG + 32)) { halt("no session keys"); return; }
             g_session = true;
             uint8_t mine[KEY_PAY]; my_key_pay(mine);
             chain_start(mine, f.p(), g_epoch, g_peer_epoch);
@@ -1518,7 +1551,7 @@ static void handle(const Frame& f) {
         if (s_phase == S_KEY) {
             if (cr_join(DES_PLANT, f.p())) { halt("the plant's key share failed its check"); return; }
             g_peer_epoch = h->epoch;
-            if (cr_session(g_peer_epoch, g_epoch)) { halt("no session keys"); return; }
+            if (cr_session(g_peer_epoch, g_epoch, nullptr)) { halt("no session keys"); return; }   // e_S erased
             g_session = true;
             uint8_t mine[KEY_PAY]; my_key_pay(mine);
             chain_start(f.p(), mine, g_peer_epoch, g_epoch);
@@ -1613,6 +1646,7 @@ static void split_setup() {
         wipe(m.data(), m.size());
     }
     if (cr_keygen(DES_SUPERVISOR, s_seed, g_mykey)) { halt("key generation failed"); return; }
+    if (cr_ephemeral(s_seed, g_myeph)) { halt("key generation failed"); return; }   // e_S: see cr_session
     cr_kdf(s_seed, "des_split zeros", s_zs);           // z_0
     if (!DES_TRANSPORT_IMPL.begin()) { halt("network down"); return; }
     DES_LOG("[split] SUPERVISOR board, epoch %08x, config %08x, P-%d: %d states, %d events, "

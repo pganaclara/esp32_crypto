@@ -139,11 +139,21 @@ static int cr_join(uint8_t role, const uint8_t msg[KEY_MSG]) {
     g_mY = madd(g_mY, g_mYj);
     return g_mY ? 0 : -1;
 }
-static int cr_session(uint32_t epoch_plant, uint32_t epoch_supervisor) {
+static uint64_t g_mnege = 0;                        // N - e_S, the supervisor's, until cr_session
+static int cr_ephemeral(const uint8_t seed[32], uint8_t E[PT_RAW]) {
+    uint64_t e = mdet(seed, "event", 0, 0) % (MP - 1) + 1;
+    put(e, E); g_mnege = MP - e;
+    return 0;
+}
+static int cr_session(uint32_t epoch_plant, uint32_t epoch_supervisor, const uint8_t* E_S) {
     uint64_t w = mmul(g_mnegk, g_mYj);              // -k_i k_j: the same on both boards
+    uint64_t x = E_S ? mmul(g_mnegk, get_raw(E_S))  // -k_P e_S, or -e_S k_P on the supervisor
+                     : mmul(g_mnege, g_mYj);
+    g_mnege = 0;
+    if (!x) return -1;
     for (int d = 0; d < 3; ++d) {
         uint8_t m[17];
-        memcpy(m, &w, 8); m[8] = (uint8_t)(d + 1);
+        memcpy(m, d < 2 ? &w : &x, 8); m[8] = (uint8_t)(d + 1);
         memcpy(m + 9, &epoch_plant, 4); memcpy(m + 13, &epoch_supervisor, 4);
         if (d < 2) g_mmac[d] = mhash(m, sizeof(m));
         else for (int i = 0; i < 4; ++i) { uint64_t h = mhash(m, sizeof(m), 1469598103934665603ULL + i); memcpy(g_evk + 8 * i, &h, 8); }

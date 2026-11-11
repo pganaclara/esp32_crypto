@@ -12,7 +12,7 @@ check takes the recording, the supervisor's tables (the header) and its
 opening (the seed it printed at boot, given to the auditor only), and its
 identity public key (DES_PUB_SUPERVISOR of secrets.h). From the seed and the
 events of the run (encrypted in the plant's STEP frames: the seed gives the
-supervisor's key share, and with the plant's share in its KEY, the key of the
+supervisor's ephemeral key, and with the plant's share in its KEY, the key of the
 event's encryption) it redoes everything the supervisor board computed: its key share, the
 initial encryption, and, at every step, the new encrypted state and every
 decision with the supervisor's part of its decryption. It compares them with
@@ -223,7 +223,7 @@ def check(a):
     NS, E, P, SC = t['NS'], t['E'], 2 * g.size, g.size
     CELL, SIG = 2 * P, P + SC
     KEY_MSG = P + SIG
-    KEY_PAY = KEY_MSG + 32
+    KEY_PAY = KEY_MSG + 32 + P                   # share, proof, commitment, E_S
     DECS_ITEM = 8 + CELL + P
     au = Audit(g, bytes.fromhex(a.seed))
     Xs = g.point(bytes.fromhex(a.supervisor_pub))
@@ -250,16 +250,20 @@ def check(a):
 
     # the opening: the commitment, the share
     commit = sha(b'des_split commit' + au.seed + tables_bytes(t))
-    if commit != s_pay[KEY_MSG:KEY_PAY]:
+    if commit != s_pay[KEY_MSG:KEY_MSG + 32]:
         sys.exit('the seed and the tables do not open the supervisor\'s commitment')
     print('commitment opened: the seed and the tables are those the supervisor committed to at boot')
     kS = au.det_scalar('share', 0, 0)
     if g.raw(g.mul(kS, g.G)) != s_pay[:P]: sys.exit('the supervisor\'s key share is not derived from its seed')
     Yp = g.point(p_pay[:P])
     au.Y = g.add(Yp, g.point(s_pay[:P]))
-    # the key of the event's encryption (cr_session), K_1, and the supervisor's seed of
-    # the encryptions of zero of the boot, z_0; both move on at every step
-    w = g.raw(g.mul(g.n - kS, Yp))[:SC]
+    # the key of the event's encryption (cr_session), K_1, from the supervisor's
+    # ephemeral key e_S and the plant's share, and the supervisor's seed of the
+    # encryptions of zero of the boot, z_0; both move on at every step
+    eS = au.det_scalar('event', 0, 0)
+    if g.raw(g.mul(eS, g.G)) != s_pay[KEY_MSG + 32:KEY_PAY]:
+        sys.exit('the supervisor\'s ephemeral key is not derived from its seed')
+    w = g.raw(g.mul(g.n - eS, Yp))[:SC]
     evk = hmac.new(w, b'des_split' + bytes([3]) + struct.pack('<II', ep, es), hashlib.sha256).digest()
     zs = kdf(au.seed, b'des_split zeros')
 

@@ -323,7 +323,8 @@ preparing a candidate for every transition of every event (versions 1–6).
 * **The event on the network.** σ travels encrypted with a symmetric stream
   cipher, apart from the ElGamal encryption of the state, and S decrypts it as
   it arrives: σ ⊕ the first two bytes of HMAC-SHA256(K_k, "des_split event"), where K_1 = HMAC-SHA256 under
-  x(k_P k_S G) of "des_split" ‖ 3 ‖ both epochs, as the MAC keys of §9, and
+  x(k_P k_S G) of "des_split" ‖ 3 ‖ both epochs, as the MAC keys of §9 (version
+  8 makes it from an ephemeral key instead, §14), and
   K_{k+1} = HMAC-SHA256(K_k, "des_split next"). A `STEP` sent again carries the
   same encrypted event. The record of §12 holds the encrypted event: with σ in the
   clear, whoever records the network could find it by trying every event
@@ -398,7 +399,7 @@ its addition to the cell). Encrypting the initial state takes 10.2 s.
 
 On the 3-cluster tool (one run): 44 of 44 steps pass, 2 NACKs and 6 rows sent
 again, 1961.3 ms per step (1937.1–2071.0; 1951.5 ms without the five steps
-above 2 s, which waited 60–120 ms more for their rows). Of that, 596.4 ms of
+above 2 s, which waited 50–120 ms longer for their rows than the median step). Of that, 596.4 ms of
 waiting and 1364.9 ms of zero tests on P (124.1 ms per row); S makes the new
 state in 5.1 ms and the rows in 1787.0 ms (162.5 ms per row). S prepares 11
 Enc(0) per step, 227.8 ms each: about 2.5 s between events, against 189.9 s
@@ -423,3 +424,42 @@ of the 900 rows twice; every decision still came right. P now waits, before a
 gap of the earlier steps and the mean gap of this step's rows so far) plus
 300 ms: on a host, with S
 slowed to 450 ms per row, 168 `NACK`s in 28 steps before and 1 after.
+
+## 14. Version 8: the key of the events from an ephemeral key
+
+In version 7, K_1 came from x(k_P k_S G), as the MAC keys do. k_S stays in S's
+RAM all run (S needs it for every D), and Y_P is in P's `KEY`, so whoever read
+S's memory could redo K_1, then every K_k, and decrypt the encrypted event that
+S keeps for the record and every `STEP` it had recorded; from the events and
+the tables it would follow the state. The ratchet did not help: it kept no old
+key in RAM, but K_1 could be made again.
+
+Now S derives an ephemeral key e_S from the seed (tag "event", as k_S is
+derived with "share") and sends E_S = e_S·G in its signed `KEY`, after the
+commitment. Both boards make K_1 = HMAC-SHA256 under x(e_S k_P G) of
+"des_split" ‖ 3 ‖ both epochs: S as (N − e_S)·Y_P, P as (N − k_P)·E_S, the same
+point. S erases e_S as soon as K_1 is made, at the start of the session,
+before it encrypts the initial state. A later read of S finds k_S, Y_P and
+E_S, from which K_1 would take the Diffie–Hellman of E_S and Y_P. The MAC keys
+are unchanged. The auditor derives e_S from the seed, checks it against E_S,
+and makes K_1 from e_S and Y_P. The cost is two scalar multiplications on S
+and one on P, at boot.
+
+On the host with mbedTLS 3.6 (P-256): the 2- and 3-cluster tools pass every
+step, the 2-cluster tool also with 20 % of the frames dropped, and the mock
+group too; the audit passes every step of these recorded runs, recovers the
+event of a step whose `STEP` was removed, and reports the supervisor that adds
+an encryption of 1 to row 0 of step 3. With k_S, Y_P and the epochs of a
+recorded 3-cluster run, the K_1 of version 7 decrypts all 44 events of that
+run; on a run of version 8 it decrypts none, and the auditor's K_1, from e_S,
+all 44. Both roles build for the ESP32-S3.
+
+On the boards (P-256, 2-cluster tool, one run): 28 of 28 steps pass, no frame
+resent, 1099.1 ms per step (1070.0–1228.0); four steps waited 79–134 ms
+longer for their rows than the median step, with the same zero tests, and
+without them the mean is 1081.9 ms, as in version 7 (1078.1 ms). S makes the
+new state in 0.6 ms and the rows in 933.1 ms (133.3 ms per row); P waits
+230.5 ms and tests the rows in 868.7 ms (124.1 ms per row). S prepares 7
+Enc(0) per step, 227.5 ms each: 1.6 s between events. From the first event to
+the end of the run, 73.4 s on P's clock (2.62 s per event); encrypting the
+initial state took 10.3 s.
