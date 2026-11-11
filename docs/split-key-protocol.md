@@ -463,3 +463,13 @@ new state in 0.6 ms and the rows in 933.1 ms (133.3 ms per row); P waits
 Enc(0) per step, 227.5 ms each: 1.6 s between events. From the first event to
 the end of the run, 73.4 s on P's clock (2.62 s per event); encrypting the
 initial state took 10.3 s.
+
+On the 3-cluster tool (one run): 44 of 44 steps pass, 1 `NACK` and 4 rows
+sent again, 1975.9 ms per step (1933.0–2148.5); nine steps waited 63–212 ms
+longer for their rows than the median step, with the same zero tests, and
+without them the mean is 1947.2 ms, as in version 7 (1951.5 ms without its
+five slow steps). S makes the new state in 5.1 ms and the rows in 1783.1 ms
+(162.1 ms per row); P waits 613.5 ms and tests the rows in 1362.4 ms
+(123.9 ms per row). S prepares 11 Enc(0) per step, 227.2 ms each: 2.5 s
+between events. From the first event to the end of the run, 194.0 s on P's
+clock (4.41 s per event); encrypting the initial state took 95.2 s.

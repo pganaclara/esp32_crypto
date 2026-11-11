@@ -210,23 +210,23 @@ step.
 ## On the boards
 
 Two ESP32-S3, P-256, one run per size; every decision of every step matched
-the supervisor in clear. The 2-cluster run is of this code; the 3- and
-4-cluster runs were made before the key of the events came from an ephemeral
+the supervisor in clear. The 2- and 3-cluster runs are of this code; the
+4-cluster run was made before the key of the events came from an ephemeral
 key, which changes the boot only:
 
 | | 2-cluster tool | 3-cluster tool | 4-cluster tool |
 |---|---|---|---|
 | states, decision rows, steps | 45, 7, 28 | 419, 11, 44 | 4184, 15, 60 |
-| step, mean (from the event to the decisions) | 1099.1 ms (1070.0–1228.0) | 1961.3 ms (1937.1–2071.0) | 6876.1 ms (6844.4–7001.2) |
-| plant: waiting for the rows | 230.5 ms | 596.4 ms | 5015.5 ms |
-| plant: zero tests | 868.7 ms (124.1 ms per row) | 1364.9 ms (124.1 ms per row) | 1860.6 ms (124.0 ms per row) |
+| step, mean (from the event to the decisions) | 1099.1 ms (1070.0–1228.0) | 1975.9 ms (1933.0–2148.5) | 6876.1 ms (6844.4–7001.2) |
+| plant: waiting for the rows | 230.5 ms | 613.5 ms | 5015.5 ms |
+| plant: zero tests | 868.7 ms (124.1 ms per row) | 1362.4 ms (123.9 ms per row) | 1860.6 ms (124.0 ms per row) |
 | supervisor: the new state (decrypting the event, moving the cells) | 0.6 ms | 5.1 ms | 50.0 ms |
-| supervisor: the rows | 933.1 ms (133.3 ms per row) | 1787.0 ms (162.5 ms per row) | 6627.6 ms (441.8 ms per row) |
+| supervisor: the rows | 933.1 ms (133.3 ms per row) | 1783.1 ms (162.1 ms per row) | 6627.6 ms (441.8 ms per row) |
 | supervisor: Enc(0) per step, drawn before the event | 7, one per row | 11, one per row | 15, one per row |
-| supervisor, between events | 1.6 s (227.5 ms per Enc(0)) | 2.5 s (227.8 ms per Enc(0)) | 3.4 s (228.0 ms per Enc(0)) |
+| supervisor, between events | 1.6 s (227.5 ms per Enc(0)) | 2.5 s (227.2 ms per Enc(0)) | 3.4 s (228.0 ms per Enc(0)) |
 | from the first event to the end of the run (plant) | 73.4 s (2.62 s per event) | 194.0 s (4.41 s per event) | 614.5 s (10.24 s per event) |
-| encrypting the initial state | 10.3 s | 95.5 s | 952.8 s |
-| rows sent again | 0 | 6 (2 NACKs) | 896 (821 NACKs, see below) |
+| encrypting the initial state | 10.3 s | 95.2 s | 952.8 s |
+| rows sent again | 0 | 4 (1 NACK) | 896 (821 NACKs, see below) |
 
 A row costs the supervisor more than a zero test costs the plant (most of it
 is D = −k_S U, the rest the sum), so the step is the supervisor's new state
@@ -237,12 +237,13 @@ the initial state with the number of states. In the 2-cluster run, four steps
 (1166.7–1228.0 ms) waited 79–134 ms longer for their rows than the median
 step, with the same zero tests and no frame sent again; without them the mean
 is 1081.9 ms (1070.0–1101.6), as before the ephemeral key (1078.1 ms,
-1071.9–1091.5, in the run of commit `ab60d96`). In the 3-cluster run, five
-steps (2001–2071 ms) waited 50–120 ms longer for their rows than the median
-step, with the same zero tests; without them the mean is 1951.5 ms. A whole
+1071.9–1091.5, in the run of commit `ab60d96`). In the 3-cluster run, nine steps (2016.0–2148.5 ms) waited 63–212 ms longer
+for their rows than the median step, with the same zero tests; without them
+the mean is 1947.2 ms (1933.0–1989.9), as before the ephemeral key (1951.5 ms
+without the five slow steps of that run, 1961.3 ms with them). A whole
 2-cluster run takes about 1.4 min: 10.3 s encrypting the initial state, then
 73.4 s for the 28 events. A whole 3-cluster run takes about 5 min:
-95.5 s encrypting the initial state, then 194.0 s for the 44 events (the
+95.2 s encrypting the initial state, then 194.0 s for the 44 events (the
 plant's clock, from the first event to the end). The 4-cluster run took
 26.4 min from the plant's boot, both boards reset together: 952.8 s encrypting
 the initial state, then 614.5 s for the 60 events. There a row took the
