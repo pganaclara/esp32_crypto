@@ -407,3 +407,19 @@ end of the run, 194.0 s on P's clock (4.41 s per event); with the 95.5 s of
 encrypting the initial state, a whole run takes about 5 min, against about
 2.4 h before the cells moved (44 × (1.97 + 189.9 s) + 95.5 s, from that run's
 means).
+
+On the 4-cluster tool (4184 states, 15 rows, one run, PSRAM on S): 60 of 60
+steps pass, 6876.1 ms per step (6844.4–7001.2), against 116411.5 ms for
+version 6 (its first 10 steps). Of that, 5015.5 ms of waiting and 1860.6 ms
+of zero tests on P (124.0 ms per row); S makes the new state in 50.0 ms and
+the rows in 6627.6 ms (441.8 ms per row). S prepares 15 Enc(0) per step,
+228.0 ms each: about 3.4 s between events, against 3101.0 s for version 6.
+The 60 events took 614.5 s on P's clock (10.24 s per event), and encrypting
+the initial state 952.8 s: 26.4 min from P's boot, against about 54 h for
+version 6. Since a row took S longer than the 300 ms of silence after which
+P then sent a `NACK`, P asked in almost every gap (821 `NACK`s) and S sent 896
+of the 900 rows twice; every decision still came right. P now waits, before a
+`NACK`, twice the gap at which the rows come (the larger of the fastest mean
+gap of the earlier steps and the mean gap of this step's rows so far) plus
+300 ms: on a host, with S
+slowed to 450 ms per row, 168 `NACK`s in 28 steps before and 1 after.

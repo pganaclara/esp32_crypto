@@ -1024,6 +1024,8 @@ static int8_t   p_dec[EVENT_COUNT];            // 1 enabled, 0 disabled
 static RxSet    p_rx;
 static uint32_t p_t_send = 0, p_t_progress = 0;
 static uint32_t p_min_dec_ms = 0;              // fastest wait for the decisions: the timeout
+static uint32_t p_row_ms = 0;                  // fastest mean gap between two rows of a step
+static uint32_t p_t_row0 = 0;                  // when the first row of step p_k came
 static uint32_t p_s_ready = 0;                 // READY(k): the supervisor is ready for step k
 static std::vector<uint8_t> p_hd;              // hashes of this step's DECS frames
 static uint8_t  p_sign[SIGN_PAY];              // the supervisor's SIGN of step p_sign_k
@@ -1155,6 +1157,10 @@ static void decided() {
         ++p_steps;
         // The FASTEST time: a slow step (a resend) must not stretch the next wait.
         if (p_min_dec_ms == 0 || td / 1000 < p_min_dec_ms) p_min_dec_ms = (uint32_t)(td / 1000);
+        if (g_rows.size() > 1) {
+            uint32_t gap = (p_rx.t_last - p_t_row0) / (uint32_t)(g_rows.size() - 1);
+            if (p_row_ms == 0 || gap < p_row_ms) p_row_ms = gap;
+        }
     } else {
         DES_LOG("  %s\n", ok ? "OK" : "MISMATCH");
     }
@@ -1195,6 +1201,7 @@ static void handle(const Frame& f) {
         if (p_phase != P_DECS || h->seq != p_k || !shape_ok(h, (int)g_rows.size(), 1) ||
             !p_rx.mark(h)) return;
         p_t_progress = des_millis();
+        if (p_rx.have == 1) p_t_row0 = p_rx.t_last;
         if (p_hd.empty()) p_hd.assign((size_t)32 * h->nchunks, 0);
         cr_sha256(f.p(), DECS_ITEM, &p_hd[(size_t)32 * h->chunk]);
         uint64_t t0 = des_micros();
@@ -1275,12 +1282,22 @@ static void split_loop() {
         if (now - p_t_send > 500) { send_key(); p_t_send = now; }
         break;
     case P_DECS:
-        if (p_rx.have == 0 && now - p_t_send > 1000 + 2 * p_min_dec_ms) {
-            if (p_k > 0) { send_step(); ++g_resent; }  // the STEP lost?
-            else send_nack(p_rx);                      // the boot rows lost?
-            p_t_send = now;
-        } else if (p_rx.have > 0 && now - p_rx.t_last > 300 && now - p_t_send > 300) {
-            send_nack(p_rx); p_t_send = now;           // a row lost? (only rows made are resent)
+        if (p_rx.have == 0) {
+            if (now - p_t_send > 1000 + 2 * p_min_dec_ms) {
+                if (p_k > 0) { send_step(); ++g_resent; }  // the STEP lost?
+                else send_nack(p_rx);                      // the boot rows lost?
+                p_t_send = now;
+            }
+        } else {
+            // A row lost? The supervisor makes the rows one after another, so
+            // they come a gap apart: the larger of the fastest mean gap of the
+            // earlier steps and the mean gap of this step's rows so far.
+            // Silence for twice the gap (and 300 ms) means a lost row; only
+            // rows already made are sent again.
+            uint32_t gap = p_row_ms;
+            if (p_rx.have > 1) gap = std::max(gap, (p_rx.t_last - p_t_row0) / (uint32_t)(p_rx.have - 1));
+            uint32_t wait = 300 + 2 * gap;
+            if (now - p_rx.t_last > wait && now - p_t_send > wait) { send_nack(p_rx); p_t_send = now; }
         }
         break;
     case P_WAIT:

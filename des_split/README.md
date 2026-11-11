@@ -37,7 +37,8 @@ per addition.
 | `SIGN` | supervisor → plant: the signed record of the step | 1 |
 
 A lost frame is asked for again: a `STEP` that gets no row is sent again, and
-a missing row is asked for with a `NACK`. Cells are stored uncompressed (96
+a missing row is asked for with a `NACK` after a silence of twice the gap at
+which the rows come (measured by the plant) plus 300 ms. Cells are stored uncompressed (96
 bytes on P-192, 128 on P-256), so no square root is computed to read a point;
 a point that is not on the curve is refused. The supervisor sends each row as
 soon as it is made, and the plant tests it while the supervisor makes the next.
@@ -199,19 +200,19 @@ step.
 Two ESP32-S3, P-256, one run per size; every decision of every step matched
 the supervisor in clear:
 
-| | 2-cluster tool | 3-cluster tool |
-|---|---|---|
-| states, decision rows, steps | 45, 7, 28 | 419, 11, 44 |
-| step, mean (from the event to the decisions) | 1078.1 ms (1071.9–1091.5) | 1961.3 ms (1937.1–2071.0) |
-| plant: waiting for the rows | 210.1 ms | 596.4 ms |
-| plant: zero tests | 868.0 ms (124.0 ms per row) | 1364.9 ms (124.1 ms per row) |
-| supervisor: the new state (decrypting the event, moving the cells) | 0.6 ms | 5.1 ms |
-| supervisor: the rows | 931.5 ms (133.1 ms per row) | 1787.0 ms (162.5 ms per row) |
-| supervisor: Enc(0) per step, drawn before the event | 7, one per row | 11, one per row |
-| supervisor, between events | 1.6 s (227.3 ms per Enc(0)) | 2.5 s (227.8 ms per Enc(0)) |
-| from the first event to the end of the run (plant) | not measured | 194.0 s (4.41 s per event) |
-| encrypting the initial state | 10.2 s | 95.5 s |
-| rows asked for again | 0 | 6 (2 NACKs) |
+| | 2-cluster tool | 3-cluster tool | 4-cluster tool |
+|---|---|---|---|
+| states, decision rows, steps | 45, 7, 28 | 419, 11, 44 | 4184, 15, 60 |
+| step, mean (from the event to the decisions) | 1078.1 ms (1071.9–1091.5) | 1961.3 ms (1937.1–2071.0) | 6876.1 ms (6844.4–7001.2) |
+| plant: waiting for the rows | 210.1 ms | 596.4 ms | 5015.5 ms |
+| plant: zero tests | 868.0 ms (124.0 ms per row) | 1364.9 ms (124.1 ms per row) | 1860.6 ms (124.0 ms per row) |
+| supervisor: the new state (decrypting the event, moving the cells) | 0.6 ms | 5.1 ms | 50.0 ms |
+| supervisor: the rows | 931.5 ms (133.1 ms per row) | 1787.0 ms (162.5 ms per row) | 6627.6 ms (441.8 ms per row) |
+| supervisor: Enc(0) per step, drawn before the event | 7, one per row | 11, one per row | 15, one per row |
+| supervisor, between events | 1.6 s (227.3 ms per Enc(0)) | 2.5 s (227.8 ms per Enc(0)) | 3.4 s (228.0 ms per Enc(0)) |
+| from the first event to the end of the run (plant) | not measured | 194.0 s (4.41 s per event) | 614.5 s (10.24 s per event) |
+| encrypting the initial state | 10.2 s | 95.5 s | 952.8 s |
+| rows sent again | 0 | 6 (2 NACKs) | 896 (821 NACKs, see below) |
 
 A row costs the supervisor more than a zero test costs the plant (most of it
 is D = −k_S U, the rest the sum), so the step is the supervisor's new state
@@ -222,7 +223,15 @@ the initial state with the number of states. In the 3-cluster run, five steps
 (2001–2071 ms) waited 60–120 ms more for their rows, with the same zero tests;
 without them the mean is 1951.5 ms. A whole 3-cluster run takes about 5 min:
 95.5 s encrypting the initial state, then 194.0 s for the 44 events (the
-plant's clock, from the first event to the end).
+plant's clock, from the first event to the end). The 4-cluster run took
+26.4 min from the plant's boot, both boards reset together: 952.8 s encrypting
+the initial state, then 614.5 s for the 60 events. There a row took the
+supervisor 441.8 ms, longer than the 300 ms of silence after which the plant
+then asked with a `NACK` for the rows it lacked: it asked in almost every gap,
+and the supervisor sent almost every row twice. Every decision still came
+right; the plant drops the copies. The plant now waits twice the gap between
+rows that it measures: on a host, with a supervisor slowed to 450 ms per row,
+the plant sent 168 `NACK`s in 28 steps before this change and 1 after it.
 
 Before the cells moved and the event was encrypted, the supervisor also added a
 fresh encryption of zero to every cell before every event, and drew another
