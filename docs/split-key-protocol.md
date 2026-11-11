@@ -300,58 +300,110 @@ Lucas's proposal: as a supervisor of the supervisory control theory, S
 receives the event and updates its state for that event only, instead of
 preparing a candidate for every transition of every event (versions 1–6).
 
-* **Before the event.** S adds a fresh Enc_Y(0) to every cell of its state, in
-  place (tag "rr", step k, state q); tops up a pool of fresh Enc_Y(0) for the
-  states that the event will lead nothing into (tag "z0", the j-th since boot)
-  to n − min_σ |states σ leads into|; and draws one Enc_Y(0) per decision row
-  (tag "dz").
-* **Step.** P sends `STEP` with the event σ. S computes c'[q'] = Σ c[q] over
-  the q that σ leads to q' (in these supervisors a copy of one cell), and gives
-  every state that σ does not reach the next zero of the pool, in the order of
-  the states. Then every distinct controllable row: the sum of its cells and
-  of its Enc_Y(0), and D = −k_S·U, sent one row per frame. P zero-tests each
-  row as it arrives. There is no permutation, no candidate and no `NEWST`: P
-  never receives a cell of the state. The step's only scalar multiplications
-  are the D of S, one per row, and the zero tests of P; a sum is kept in
-  Jacobian coordinates, with one field inversion per point at the end.
-* **Encryptions of zero.** S draws n + (states σ does not reach) + rows per
-  step, on average 45 + 39.7 + 7 for the 2-cluster tool and 419 + 374.8 + 11
-  for 3 clusters on the recorded traces (P none), against |transitions| + rows
+* **Before the event.** S draws one fresh Enc_Y(0) per decision row (tag
+  "dz").
+* **Step.** P sends `STEP` with the event σ, encrypted (below). S moves the
+  cells: c'[q'] = c[q] for the q that σ leads to q' (the sum of their cells if
+  σ leads several states to q'). The cells of the states that σ does not leave
+  all encrypt 0, since the current state is one that σ leaves; they go, in the
+  order of the states, to the states that σ leads nothing into. When no two
+  states go to the same state on one event there are exactly as many, and so
+  in every supervisor of the repository (the 2-, 3- and 4-cluster tools, the
+  small and the extended small factory); otherwise the states left get fresh
+  Enc_Y(0) drawn at the event (tag "z0"). Then every distinct controllable
+  row: the sum of its cells and of its Enc_Y(0), and D = −k_S·U, sent one row
+  per frame. P zero-tests each row as it arrives. There is no permutation, no
+  candidate and no `NEWST`: P never receives a cell of the state. The step's
+  only scalar multiplications are the D of S, one per row, and the zero tests
+  of P; a sum is kept in Jacobian coordinates, with one field inversion per
+  point at the end.
+* **Encryptions of zero.** S draws one per decision row and step, 7 for the
+  2-cluster tool and 11 for 3 clusters (P none), against |transitions| + rows
   for S and n for P in version 6 (81 + 45 for 2 clusters, 983 + 419 for 3).
-  Without them, the moved cells would be the old ones and the cells that σ
-  does not reach would be (O, O), and whoever reads S's memory would see the
-  state. Whoever reads it both after a preparation and after the next event
-  sees which cells were copied where, so that event.
+* **The event on the network.** σ travels encrypted with a symmetric stream
+  cipher, apart from the ElGamal encryption of the state, and S decrypts it as
+  it arrives: σ ⊕ the first two bytes of HMAC-SHA256(K_k, "des_split event"), where K_1 = HMAC-SHA256 under
+  x(k_P k_S G) of "des_split" ‖ 3 ‖ both epochs, as the MAC keys of §9, and
+  K_{k+1} = HMAC-SHA256(K_k, "des_split next"). A `STEP` sent again carries the
+  same encrypted event. The record of §12 holds the encrypted event: with σ in the
+  clear, whoever records the network could find it by trying every event
+  against the signed h_k, since h_{k−1}, k and the `DECS` frames are all on the
+  network.
+* **S's memory.** The seed of §12 is erased once the initial state is
+  encrypted (S prints it at boot, for the auditor). The Enc_Y(0) of step k come
+  from z_k, with z_0 = HMAC-SHA256(seed, "des_split zeros") and z_{k+1} =
+  HMAC-SHA256(z_k, "des_split next") as soon as step k's new state is made; K
+  moves on in the same way (a hash ratchet). S keeps the event nowhere after
+  the move, only its encrypted form for the record, and erases which states the
+  event left and entered. With the seed, a memory read would redo the initial
+  encryption and so decrypt every cell, since the cells only move.
 * **What each party learns.** S learns the events and, with its tables, can
-  follow the state; the split key no longer keeps the state from S, only from
-  whoever reads either board's memory without the events of the run. P learns
+  follow the state; the split key no longer keeps the state from S. P learns
   the decisions only: no target sets, since it receives no candidates. The
   Enc_Y(0) of every decision sum stays: without it, a row that is the union of
-  two others would show as U_3 = U_1 + U_2. The network sees the events (frames
-  are authenticated, not encrypted).
-* **Audit.** h_k = SHA-256(h_{k−1} ‖ k ‖ σ_k ‖ H(DECS)); the auditor computes
-  the state from the seed and the recorded events, and recovers the event of a
-  step whose `STEP` it did not record from the signed h_k.
+  two others would show as U_3 = U_1 + U_2. The network sees neither the
+  events nor the state, only when the frames go. One read of S's memory finds
+  ciphertexts that it cannot relate to anything: neither the seed nor a key of
+  an earlier step is left. Two reads see where each cell moved in between, and
+  so the events in between; whoever knows the state at the first read (at
+  boot, for instance, when it is the initial state of the tables) knows it at
+  the second. One read and a recording of the network from then on decrypt the
+  events that follow, since the next step's K is in RAM. S re-randomized every cell before every event in the version
+  measured below, which limited this to two reads around one event, at the
+  price of n + (the states σ leads nothing into) Enc_Y(0) more per step.
+* **Audit.** h_k = SHA-256(h_{k−1} ‖ k ‖ x_k ‖ H(DECS)), x_k the encrypted event.
+  The auditor derives k_S from the seed and K_1 from k_S and P's share in its
+  `KEY`, decrypts the events, computes the state, and recovers the event of a
+  step whose `STEP` it did not record from the signed h_k. The seed thus gives
+  the auditor the events and the state of the run, which it needs to check
+  the sums.
 
 On the host with mbedTLS 3.6 (P-256), the 2- and 3-cluster tools passed every
-step (29.8 and 69.5 ms per step, against 49.5 and 279 ms when S re-randomized
-every cell after the event), the 2-cluster tool also with 20 % of the frames
-dropped; the audit
-passed every step of the recorded 2- and 3-cluster runs, recovered an unrecorded event from the signature,
-and reported a supervisor that added an encryption of 1 to row 0 of step 3.
+step (18.7 and 34.8 ms per step), the 2-cluster tool also with 20 % of the
+frames dropped; the audit passed every step of the recorded 2- and 3-cluster
+runs, recovered the event of a step whose `STEP` was removed from the
+recording, and reported a supervisor that added an encryption of 1 to row 0
+of step 3. A copy of the 2-cluster tool with four transitions added that lead
+a second state into a state that the event already enters passed every step,
+and so did its audit. None of the 72 `STEP` frames recorded in the 2- and
+3-cluster runs carries a value below 64, as a clear event would.
 
-On two ESP32-S3 (P-256, 2-cluster tool, one run): 28 of 28 steps pass, no
-frame resent, 1083.1 ms per step (1074.0–1120.3), against 2058.1 ms for
-version 6. Of that, 214.0 ms of waiting and 869.1 ms of zero tests on P
-(124.2 ms per row); S makes the new state in 0.3 ms and the rows in 933.1 ms
-(133.3 ms per row), overlapped with the zero tests. S prepares 91.7 Enc(0) per
-step on average, 235.7 ms each: about 21.6 s between events (19.7 s for
-version 6).
+On two ESP32-S3 (P-256, one run per size), measured with the version in which
+S re-randomized every cell before every event (tag "rr") and drew a pool of
+Enc_Y(0) for the states that the event leads nothing into (commit `d185bfd`): on the 2-cluster
+tool, 28 of 28 steps pass, no frame resent, 1083.1 ms per step
+(1074.0–1120.3), against 2058.1 ms for version 6. Of that, 214.0 ms of
+waiting and 869.1 ms of zero tests on P (124.2 ms per row); S makes the new
+state in 0.3 ms and the rows in 933.1 ms (133.3 ms per row), overlapped with
+the zero tests. S prepared 91.7 Enc(0) per step on average (45 + 39.7 + 7),
+235.7 ms each: about 21.6 s between events (19.7 s for version 6).
 
 On the 3-cluster tool (one run): 44 of 44 steps pass, one row asked for again,
 1972.0 ms per step (1933.9–2243.6), against 10855.6 ms for version 6. Of that,
 606.4 ms of waiting and 1365.6 ms of zero tests on P (124.1 ms per row); S
 makes the new state in 5.5 ms and the rows in 1787.5 ms (162.5 ms per row). S
-prepares 804.8 Enc(0) per step, 235.9 ms each: about 189.9 s between events
-(240.9 s for version 6). Encrypting the initial state takes 95.5 s. The step
-now grows with the rows and their sums, not with the number of states.
+prepared 804.8 Enc(0) per step (419 + 374.8 + 11), 235.9 ms each: about
+189.9 s between events (240.9 s for version 6). Encrypting the initial state
+takes 95.5 s. The step now grows with the rows and their sums, not with the
+number of states.
+
+With the cells moved and the event encrypted, on the boards (P-256, 2-cluster
+tool, one run): 28 of 28 steps pass, no frame resent, 1078.1 ms per step
+(1071.9–1091.5). Of that, 210.1 ms of waiting and 868.0 ms of zero tests on P
+(124.0 ms per row); S makes the new state, decrypting the event included, in
+0.6 ms and the rows in 931.5 ms (133.1 ms per row). S prepares 7 Enc(0) per
+step, 227.3 ms each: about 1.6 s between events, against 21.6 s before the
+cells moved (235.7 ms per item there: an Enc(0), plus, for the one of a cell,
+its addition to the cell). Encrypting the initial state takes 10.2 s.
+
+On the 3-cluster tool (one run): 44 of 44 steps pass, 2 NACKs and 6 rows sent
+again, 1961.3 ms per step (1937.1–2071.0; 1951.5 ms without the five steps
+above 2 s, which waited 60–120 ms more for their rows). Of that, 596.4 ms of
+waiting and 1364.9 ms of zero tests on P (124.1 ms per row); S makes the new
+state in 5.1 ms and the rows in 1787.0 ms (162.5 ms per row). S prepares 11
+Enc(0) per step, 227.8 ms each: about 2.5 s between events, against 189.9 s
+before the cells moved and 240.9 s for version 6. From the first event to the
+end of the run, 194.0 s on P's clock (4.41 s per event); with the 95.5 s of
+encrypting the initial state, a whole run takes about 5 min, against about
+2.4 h before the cells moved (44 × (1.97 + 189.9 s) + 95.5 s, from that run's
+means).

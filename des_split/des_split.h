@@ -9,26 +9,26 @@
 // Y = k_P G + k_S G. The supervisor adds its part of the decryption to the
 // decision sums only, never to the state.
 //
-// The plant sends the event to the supervisor, which computes the next
-// encrypted state for that event only, as a supervisor of the supervisory
-// control theory does: the cell of q' is the sum of the cells c[q] of the
-// states q that the event leads to q' (a copy when there is one), and a fresh
-// Enc_Y(0) when there is none, so that no cell is (O, O). The state is never
-// decrypted, and the plant never receives it.
+// The plant sends the event to the supervisor, encrypted, and the supervisor
+// computes the next encrypted state for that event only, as a supervisor of
+// the supervisory control theory does: the cells MOVE. The cell of q' is the
+// cell of the state that the event leads to q' (the sum of their cells if it
+// leads several there); the cells left over all encrypt 0 (the current state
+// is one that the event leaves) and go to the states that the event leads
+// nothing into, so that no cell is (O, O). The state is never decrypted, and
+// the plant never receives it.
 //
 // One step (k), after the plant fired event σ:
 //
 //   plant (share k_P)                         supervisor (share k_S)
-//                                              before the event: c[q] ⊞= Enc_Y(0)
-//                                              for every q; fresh Enc_Y(0) for
-//                                              the cells σ may leave empty and
-//                                              one per decision row
+//                                              before the event: a fresh
+//                                              Enc_Y(0) per decision row
 //     ◀──────────────────────────── READY(k)
-//     STEP(k, σ)  ──────────────────────────▶  c'[q'] = Σ c[q] over the q that
-//                                              σ leads to q' (a copy), or a
-//                                              fresh Enc_Y(0); then, row by
-//                                              row: the sum of its cells ⊞
-//                                              Enc_Y(0), D = -k_S U
+//     STEP(k, σ encrypted) ─────────────────▶  c'[q'] = c[q] for the q that σ
+//                                              leads to q'; the other cells to
+//                                              the states σ leads nothing into;
+//                                              then, row by row: the sum of its
+//                                              cells ⊞ Enc_Y(0), D = -k_S U
 //     ◀──────────────────────────── DECS(k) ×rows
 //   zero test V + D - k_P U of each row
 //   as it arrives → decisions
@@ -38,20 +38,26 @@
 // learns about the supervisor: the decisions. It never receives a cell of the
 // state, and every decision sum carries its own fresh Enc_Y(0), so the rows of
 // R do not show either (without it, a row that is the union of two others
-// would have U equal to the sum of theirs). The encryption protects the state
-// against whoever reads the memory of either board without knowing the events
-// of the run: the supervisor board holds only ciphertexts of the state, and
-// the plant board holds none. (Whoever reads it both after a preparation and
-// after the next event sees which cells were copied where, so that event.)
+// would have U equal to the sum of theirs). The network sees neither the
+// events nor the state: the event travels encrypted, with a symmetric cipher
+// apart from the ElGamal of the state, under a key that only the two boards
+// hold. Whoever reads the supervisor's memory once finds ciphertexts that it
+// cannot relate to anything: the seed of the initial encryption is erased once
+// it is done, and the keys of the event's encryption and of the encryptions of
+// zero move on at every step (a hash ratchet), so none of an earlier step is
+// left. Whoever reads it twice sees where each cell moved
+// between the two reads, and so the events in between; if it knows the state
+// at the first read (at boot, for instance), it knows it at the second.
 //
-// The supervisor draws the encryptions of zero of a step BEFORE the event,
-// while it is idle, and keeps them in RAM only; each is used once and then
-// erased (a step that comes before they are ready finishes them on the spot).
-// So the step itself has no scalar multiplication but the one of D per row:
-// the new state is copies, and a sum is kept in Jacobian coordinates, with
-// one field inversion at the end. Cells are stored uncompressed, so no square
-// root is computed to read a point. The supervisor sends each row as soon as
-// it is made, and the plant tests it while the supervisor makes the next.
+// The supervisor draws the encryptions of zero of a step (one per decision
+// row) BEFORE the event, while it is idle, and keeps them in RAM only; each is
+// used once and then erased (a step that comes before they are ready finishes
+// them on the spot). So the step itself has no scalar multiplication but the
+// one of D per row: the new state is cells moved, and a sum is kept in
+// Jacobian coordinates, with one field inversion at the end. Cells are stored
+// uncompressed, so no square root is computed to read a point. The supervisor
+// sends each row as soon as it is made, and the plant tests it while the
+// supervisor makes the next.
 //
 // Each board has its own identity key (secrets.h, made by make_keys.py) and
 // knows the other's public key. The KEY frames are signed with it; every
@@ -70,10 +76,10 @@
 // instead. At boot it commits to its tables and to a secret seed from which it
 // draws all its randomness (its share, the initial encryption, the encryptions
 // of zero), and after every step it signs a chain of SHA-256 over the step's
-// event and decisions, which the plant board checks against what it sent and
-// received. An auditor given the seed and the tables redoes every step from a
-// recording of the network (audit.py) and finds any deviation, which the
-// supervisor's signature makes undeniable.
+// encrypted event and decisions, which the plant board checks against what it
+// sent and received. An auditor given the seed and the tables redoes every
+// step from a recording of the network (audit.py) and finds any deviation,
+// which the supervisor's signature makes undeniable.
 //
 // The plant board also runs the supervisor in clear, as an oracle that checks
 // every decision; a deployment would omit it, and the plant would then not
@@ -204,6 +210,8 @@ static_assert(sizeof(DES_MY_ID) - 1 == 2 * SC_BYTES && sizeof(DES_MY_PUB) - 1 ==
 
 // Implemented below with mbedTLS, or by a host test build (DES_SPLIT_MOCK).
 #define CR_FN static __attribute__((unused))   // each role uses only some of them
+// Erases a buffer (volatile writes, which the compiler keeps).
+static void wipe(void* p, size_t n) { volatile uint8_t* v = (volatile uint8_t*)p; while (n--) *v++ = 0; }
 CR_FN void cr_init(const char* pers);
 CR_FN uint32_t cr_random32();
 // This board's identity key and the other board's public key (hex; a public
@@ -211,11 +219,15 @@ CR_FN uint32_t cr_random32();
 CR_FN int  cr_identity(const char* my_priv, const char* my_pub, const char* peer_pub);
 CR_FN int  cr_sign(const uint8_t* msg, size_t len, uint8_t sig[SIG_BYTES]);          // as this board
 CR_FN int  cr_verify(const uint8_t* msg, size_t len, const uint8_t sig[SIG_BYTES]);  // the other's
-// After cr_join: one MAC key per direction, HMAC-SHA256 of the x of the
-// shares' Diffie–Hellman k_P k_S G (only the two boards can compute it) and of
-// both epochs. cr_mac signs as this board (mine) or checks the other's.
+// After cr_join: one MAC key per direction and the key of the event's
+// encryption (g_evk), HMAC-SHA256 under the x of the shares' Diffie–Hellman k_P k_S G
+// (only the two boards can compute it) of "des_split" || 1, 2 or 3 || both
+// epochs. cr_mac signs as this board (mine) or checks the other's.
+static uint8_t g_evk[32];
 CR_FN int  cr_session(uint32_t epoch_plant, uint32_t epoch_supervisor);
 CR_FN void cr_mac(bool mine, const uint8_t* msg, size_t len, uint8_t tag[DES_TAG_BYTES]);
+// out = HMAC-SHA256(key, label) (out may be key).
+CR_FN void cr_kdf(const uint8_t key[32], const char* label, uint8_t out[32]);
 // This board's share k_i: msg = Y_i = k_i G and a proof that the board knows
 // k_i (a Schnorr signature of role || Y_i under k_i). Without the proof, a
 // board that saw the other's share Y_j first could send aG - Y_j, and the
@@ -326,7 +338,7 @@ static int det_scalar(const uint8_t seed[32], const char* tag, uint32_t a, uint3
     if (ret == 0) ret = mbedtls_mpi_sub_mpi(&n1, &g_grp.N, &g_one);
     if (ret == 0) ret = mbedtls_mpi_mod_mpi(&r, &x, &n1);
     if (ret == 0) ret = mbedtls_mpi_add_mpi(s, &r, &g_one);            // 1 .. N - 1
-    memset(h, 0, sizeof(h));
+    wipe(h, sizeof(h));
     mbedtls_mpi_free(&x); mbedtls_mpi_free(&n1); mbedtls_mpi_free(&r);
     return ret;
 }
@@ -431,12 +443,13 @@ static int cr_session(uint32_t epoch_plant, uint32_t epoch_supervisor) {
     uint8_t w[PT_RAW];
     int ret = neg_share_times(&g_Yj, &W);        // -k_i k_j G: the same x on both boards
     if (ret == 0) ret = pt_to_raw(&W, w);
-    for (int d = 0; d < 2 && ret == 0; ++d) {
+    uint8_t* key[3] = {g_mac[0], g_mac[1], g_evk};
+    for (int d = 0; d < 3 && ret == 0; ++d) {
         uint8_t m[18];
         memcpy(m, "des_split", 9); m[9] = (uint8_t)(d + 1);
         memcpy(m + 10, &epoch_plant, 4); memcpy(m + 14, &epoch_supervisor, 4);
         ret = mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), w, SC_BYTES,
-                              m, sizeof(m), g_mac[d]);
+                              m, sizeof(m), key[d]);
     }
     memset(w, 0, sizeof(w));
     mbedtls_ecp_point_free(&W);
@@ -448,6 +461,13 @@ static void cr_mac(bool mine, const uint8_t* msg, size_t len, uint8_t tag[DES_TA
     mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), g_mac[d], sizeof(g_mac[d]),
                     msg, len, full);
     memcpy(tag, full, DES_TAG_BYTES);
+}
+static void cr_kdf(const uint8_t key[32], const char* label, uint8_t out[32]) {
+    uint8_t h[32];
+    mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), key, 32,
+                    (const uint8_t*)label, strlen(label), h);
+    memcpy(out, h, 32);
+    wipe(h, sizeof(h));
 }
 static int cr_keygen(uint8_t role, const uint8_t* seed, uint8_t msg[KEY_MSG]) {
     mbedtls_mpi k; mbedtls_mpi_init(&k);
@@ -937,12 +957,14 @@ static void my_key_pay(uint8_t out[KEY_PAY]) {
 }
 
 // The record of the run, for the audit. Both boards chain a SHA-256 over every
-// step's event and decisions, h_k = SHA-256(h_{k-1} || k || e_k || H(DECS)),
-// where e_k is the event (16 bits; NO_EVENT for the boot) and H(DECS) the
-// SHA-256 of the SHA-256 of each row, in row order, from h_init =
-// SHA-256("des_split record" || the plant's KEY || the supervisor's KEY ||
-// both epochs). The supervisor signs every h_k (SIGN); the plant checks that
-// it is what it sent and received.
+// step's event and decisions, h_k = SHA-256(h_{k-1} || k || x_k || H(DECS)),
+// where x_k is the event encrypted as the STEP carried it (16 bits; NO_EVENT for
+// the boot) and H(DECS) the SHA-256 of the SHA-256 of each row, in row order,
+// from h_init = SHA-256("des_split record" || the plant's KEY || the
+// supervisor's KEY || both epochs). The supervisor signs every h_k (SIGN); the
+// plant checks that it is what it sent and received. With the event in the
+// clear, whoever records the network could find it by trying every event
+// against the signed h_k.
 static uint8_t g_chain[32];
 static void chain_start(const uint8_t* key_plant, const uint8_t* key_sup, uint32_t ep, uint32_t es) {
     const uint8_t* tag = (const uint8_t*)"des_split record";
@@ -958,6 +980,25 @@ static void chain_step(uint32_t k, uint16_t ev, const std::vector<uint8_t>& hd) 
     memcpy(m, g_chain, 32); memcpy(m + 32, &k, 4); memcpy(m + 36, &ev, 2);
     cr_sha256(hd.data(), hd.size(), m + 38);
     cr_sha256(m, sizeof(m), g_chain);
+}
+// A hash ratchet: key = HMAC-SHA256(key, "des_split next"). The key of the
+// event's encryption and the supervisor's seed of the encryptions of zero move
+// on at every step, so a memory read finds no key of an earlier step.
+static void ratchet(uint8_t key[32]) { cr_kdf(key, "des_split next", key); }
+// The event of a STEP travels encrypted, with a stream cipher (symmetric, not
+// the ElGamal of the state): σ XOR the pad, the first two bytes of
+// HMAC-SHA256(K_k, "des_split event"), where K_1 = g_evk of cr_session and
+// K_{k+1} = ratchet(K_k). The supervisor decrypts it with the same pad. Each
+// board takes the pad of a step once, in step order (the plant when it fires
+// the event, the supervisor when its STEP comes), so a STEP sent again carries
+// the same encrypted event.
+static uint16_t event_pad() {
+    uint8_t h[32];
+    cr_kdf(g_evk, "des_split event", h);
+    uint16_t pad; memcpy(&pad, h, 2);
+    wipe(h, sizeof(h));
+    ratchet(g_evk);
+    return pad;
 }
 // What the supervisor signs for step k: "des_split signed" || k || h_k.
 static void signed_msg(uint32_t k, const uint8_t h[32], uint8_t m[52]) {
@@ -978,6 +1019,7 @@ enum PPhase { P_KEY, P_DECS, P_WAIT };         // P_WAIT: between events
 static PPhase   p_phase = P_KEY;
 static uint32_t p_k = 0;                       // step; 0 = boot decisions
 static int      p_ev = -1;                     // event of step p_k
+static uint16_t p_evx = NO_EVENT;              // the same, encrypted as its STEP carries it
 static int8_t   p_dec[EVENT_COUNT];            // 1 enabled, 0 disabled
 static RxSet    p_rx;
 static uint32_t p_t_send = 0, p_t_progress = 0;
@@ -992,6 +1034,7 @@ static int      p_oracle = 0;                  // the supervisor in clear
 static int      p_pass = 0, p_fail = 0;
 static uint64_t p_t0 = 0, p_tz = 0;
 static uint64_t sum_dec = 0, sum_zt = 0, sum_total = 0;
+static uint32_t p_t_boot = 0, p_t_first = 0;   // the wall clock: this board's boot, the first event
 static uint32_t p_steps = 0;
 
 static void print_bits(const char* label, const int8_t* d) {
@@ -1019,6 +1062,10 @@ static void print_summary() {
         DES_LOG("     waiting for the decisions (the supervisor's new state and sums, and the link)"
                 " %.1f | zero tests, each as its row arrives, %.1f  (ms)\n",
                 sum_dec / 1000.0 / n, sum_zt / 1000.0 / n);
+        double run = (des_millis() - p_t_first) / 1000.0;
+        DES_LOG("  run         : %.1f s from the first event to the end (%.2f s per event, the"
+                " supervisor's preparation included); %.1f s since this board's boot\n",
+                run, run / n, (des_millis() - p_t_boot) / 1000.0);
     }
     DES_LOG("  frames      : %u sent, %u received, %u resent, %u NACKs sent, "
             "%u failed authentication\n", (unsigned)g_tx, (unsigned)g_rx,
@@ -1054,12 +1101,11 @@ static void begin_decs() {
     p_t_send = p_t_progress = des_millis();
 }
 static void send_step() {
-    uint16_t ev = (uint16_t)p_ev;
-    send_simple(T_STEP, p_k, &ev, 2);
+    send_simple(T_STEP, p_k, &p_evx, 2);
 }
 
 // The next event of the trace, as the plant: a controllable event only if
-// the supervisor enables it. The event goes to the supervisor.
+// the supervisor enables it. The event goes to the supervisor, encrypted.
 static void next_step() {
     if (p_k == (uint32_t)SIM_SEQ_LEN) {
         for (int i = 0; i < 3; ++i) send_simple(T_FIN, p_k);
@@ -1079,7 +1125,8 @@ static void next_step() {
     if (to < 0) { DES_LOG("[!!] %s is impossible in the supervisor's state\n", nm); halt("trace not admissible"); return; }
     p_oracle = to;
 
-    ++p_k; p_ev = e;
+    ++p_k; p_ev = e; p_evx = (uint16_t)(e ^ event_pad());
+    if (p_k == 1) p_t_first = des_millis();
     begin_decs();
     p_t0 = des_micros();
     send_step();
@@ -1111,7 +1158,7 @@ static void decided() {
     } else {
         DES_LOG("  %s\n", ok ? "OK" : "MISMATCH");
     }
-    chain_step(p_k, p_k ? (uint16_t)p_ev : (uint16_t)NO_EVENT, p_hd);
+    chain_step(p_k, p_k ? p_evx : (uint16_t)NO_EVENT, p_hd);
     p_recorded = false;
     p_phase = P_WAIT;                              // the next event, once signed and READY
 }
@@ -1191,6 +1238,7 @@ static void bench_clear(int q0) {
 }
 
 static void split_setup() {
+    p_t_boot = des_millis();
     build_tables();
     cr_init("des_split_plant");
     g_epoch = cr_random32() | 1;
@@ -1252,82 +1300,45 @@ static void split_loop() {
 enum SPhase { S_KEY, S_IDLE, S_DECS };
 static SPhase   s_phase = S_KEY;
 static uint32_t s_k = 0;
-static uint16_t s_ev = NO_EVENT;               // the event of step s_k
+static uint16_t s_evx = NO_EVENT;              // the event of step s_k, encrypted: for its record
 static std::vector<uint8_t> s_c;               // the encrypted state, raw cells
 static std::vector<uint8_t> s_new;             // the next one, made at the event
+static std::vector<uint8_t> s_mark;            // at the event: the states it leaves and enters, then erased
 static std::vector<uint8_t> s_decs;            // DECS(s_k): one item per row, kept for resends
 static size_t   s_row_n = 0;                   // rows of s_decs made
 static uint32_t s_t_ready = 0;
 static uint64_t s_move_us = 0, s_dec_us = 0;
 static uint32_t s_steps = 0;
 
-// Prepared while idle, one item per pass of the loop, for the next step:
-//  * every cell of the state gets a fresh Enc_Y(0) ("rr"), in place, so that
-//    at the event a cell that moves is only copied, and still no cell of the
-//    new state is one the board held before this preparation;
-//  * the pool of fresh Enc_Y(0) for the states that the event leads nothing
-//    into ("z0"), topped up to the most that an event can need; the j-th zero
-//    taken from it since boot is the j-th drawn, so the auditor can redo it;
-//  * one fresh Enc_Y(0) per decision row ("dz").
-// A STEP that comes before they are all ready finishes them on the spot. Each
-// Enc_Y(0) is used once and then erased.
-static size_t   s_rr_n = 0;                    // cells of s_c re-randomized for step s_prep_k
-static std::vector<uint8_t> s_pool;            // a ring of s_pool_cap cells
-static size_t   s_pool_cap = 1, s_pool_head = 0, s_pool_cnt = 0;
-static uint32_t s_z0_used = 0;                 // zeros taken from the pool since boot
+// Prepared while idle, one per pass of the loop, for the next step: a fresh
+// Enc_Y(0) per decision row ("dz"). A STEP that comes before they are all
+// ready finishes them on the spot. Each is used once and then erased.
 static std::vector<uint8_t> s_dz;              // Enc_Y(0) per row
 static size_t   s_dz_n = 0;
 static uint32_t s_prep_k = 0;                  // the step they are for
 // The audit: all of this board's randomness comes from s_seed, committed to
-// at boot together with the tables (g_commit).
+// at boot together with the tables (g_commit). The seed is erased once the
+// initial state is encrypted; the encryptions of zero of step k come from
+// z_k, with z_0 = HMAC-SHA256(seed, "des_split zeros") and z_{k+1} =
+// ratchet(z_k) as soon as step k's new state is made. A memory read finds
+// neither the seed nor the z of an earlier step, so it cannot redo the
+// encryption of a cell of the state.
 static uint8_t  s_seed[32];
+static uint8_t  s_zs[32];                      // z of the next step that needs one
 static uint8_t  s_sign[SIGN_PAY];              // SIGN of step s_k, kept for resends
 static uint32_t s_prep_idle = 0, s_prep_step = 0, s_t_rdy = 0;
 static uint64_t s_prep_us = 0;                 // time spent preparing them while idle
 
-static bool prep_done() {
-    return s_rr_n == (size_t)NS && s_pool_cnt == s_pool_cap && s_dz_n == g_rows.size();
-}
+static bool prep_done() { return s_dz_n == g_rows.size(); }
 static void start_prepare() {
     s_prep_k = s_k + 1;
-    s_rr_n = 0;
     s_dz.assign(g_rows.size() * CELL_RAW, 0);
     s_dz_n = 0;
 }
-// The next zero of the pool, drawn at its tail.
-static int pool_draw() {
-    size_t slot = (s_pool_head + s_pool_cnt) % s_pool_cap;
-    int ret = cr_enc_det(0, s_seed, "z0", s_z0_used + (uint32_t)s_pool_cnt, 0, &s_pool[slot * CELL_RAW]);
-    if (ret == 0) ++s_pool_cnt;
-    return ret;
-}
-// The oldest zero of the pool, taken out; drawn on the spot if it is empty.
-static int pool_take(uint8_t out[CELL_RAW]) {
-    if (s_pool_cnt == 0) { int ret = pool_draw(); if (ret) return ret; }
-    uint8_t* z = &s_pool[s_pool_head * CELL_RAW];
-    memcpy(out, z, CELL_RAW);
-    memset(z, 0, CELL_RAW);                            // used once
-    s_pool_head = (s_pool_head + 1) % s_pool_cap;
-    --s_pool_cnt; ++s_z0_used;
-    return 0;
-}
 static void prepare_one(bool in_step) {
     uint64_t t0 = des_micros();
-    int ret;
-    if (s_rr_n < (size_t)NS) {
-        uint8_t z[CELL_RAW];
-        uint8_t* c = &s_c[s_rr_n * CELL_RAW];
-        const uint8_t* v[2] = {c, z};
-        ret = cr_enc_det(0, s_seed, "rr", s_prep_k, (uint32_t)s_rr_n, z);
-        if (ret == 0) ret = cr_sum(v, 2, c);
-        memset(z, 0, CELL_RAW);                        // used once
-        ++s_rr_n;
-    } else if (s_pool_cnt < s_pool_cap) {
-        ret = pool_draw();
-    } else {
-        ret = cr_enc_det(0, s_seed, "dz", s_prep_k, (uint32_t)s_dz_n, &s_dz[s_dz_n * CELL_RAW]);
-        ++s_dz_n;
-    }
+    int ret = cr_enc_det(0, s_zs, "dz", s_prep_k, (uint32_t)s_dz_n, &s_dz[s_dz_n * CELL_RAW]);
+    ++s_dz_n;
     if (ret) { halt("preparation failed"); return; }
     if (in_step) ++s_prep_step;
     else { ++s_prep_idle; s_prep_us += des_micros() - t0; }
@@ -1362,7 +1373,7 @@ static void boot_decs() {
     s_decs.assign(g_rows.size() * DECS_ITEM, 0);
     for (size_t g = 0; g < g_rows.size(); ++g) {
         uint8_t z[CELL_RAW];
-        if (cr_enc_det(0, s_seed, "dz", 0, (uint32_t)g, z) || make_row(g, z)) {
+        if (cr_enc_det(0, s_zs, "dz", 0, (uint32_t)g, z) || make_row(g, z)) {
             halt("boot decisions failed"); return;
         }
     }
@@ -1372,7 +1383,7 @@ static void boot_decs() {
 static void record_step() {
     std::vector<uint8_t> hd(32 * g_rows.size(), 0);
     for (size_t g = 0; g < g_rows.size(); ++g) cr_sha256(&s_decs[g * DECS_ITEM], DECS_ITEM, &hd[32 * g]);
-    chain_step(s_k, s_ev, hd);
+    chain_step(s_k, s_evx, hd);
     uint8_t m[52];
     signed_msg(s_k, g_chain, m);
     memcpy(s_sign, g_chain, 32);
@@ -1395,27 +1406,38 @@ static std::vector<uint8_t> tables_bytes() {
     }
     return t;
 }
-// The new state for the event s_ev: the cell of each state q' that the event
-// leads into is the sum of the re-randomized cells of the states it leads to
-// q' (a copy, as there is one in these supervisors); the cell of every other
-// state is a fresh Enc_Y(0) from the pool, taken in the order of q'.
-static void move_all() {
-    std::vector<uint8_t> reached(NS, 0);
+// The new state for the event ev: the cells move. The cell of each state q'
+// that ev leads into is the cell of the state that ev leads to q' (in these
+// supervisors there is one; if there are several, the sum of their cells).
+// The cells of the states that ev does not leave all encrypt 0, since the
+// current state is one that ev leaves; they go, in the order of the states,
+// to the states that ev leads nothing into. There are as many of them when no
+// two states go to the same one; otherwise the states left get fresh Enc_Y(0)
+// ("z0"), drawn here. No cell is copied: each is in one place only.
+static void move_all(uint16_t ev) {
     int ret = 0;
-    for (int m = g_moff[s_ev]; m < g_moff[s_ev + 1] && ret == 0; ++m) {
+    for (int m = g_moff[ev]; m < g_moff[ev + 1] && ret == 0; ++m) {
         const Move& mv = g_move[m];
         uint8_t* out = &s_new[(size_t)mv.to * CELL_RAW];
-        reached[mv.to] = 1;
-        if (mv.nsrc == 1) {
-            memcpy(out, &s_c[(size_t)g_move_src[mv.src0] * CELL_RAW], CELL_RAW);
-        } else {
-            std::vector<const uint8_t*> v;
-            for (int j = 0; j < mv.nsrc; ++j) v.push_back(&s_c[(size_t)g_move_src[mv.src0 + j] * CELL_RAW]);
-            ret = cr_sum(v.data(), (int)v.size(), out);
+        s_mark[mv.to] |= 2;                            // ev enters it
+        for (int j = 0; j < mv.nsrc && ret == 0; ++j) {
+            int q = g_move_src[mv.src0 + j];
+            s_mark[q] |= 1;                            // ev leaves it
+            const uint8_t* v[2] = {out, &s_c[(size_t)q * CELL_RAW]};
+            if (j == 0) memcpy(out, v[1], CELL_RAW);
+            else ret = cr_sum(v, 2, out);
         }
     }
-    for (int q = 0; q < NS && ret == 0; ++q)
-        if (!reached[q]) ret = pool_take(&s_new[(size_t)q * CELL_RAW]);
+    int left = 0;                                      // the next cell that ev does not leave
+    uint32_t z = 0;
+    for (int q = 0; q < NS && ret == 0; ++q) {
+        if (s_mark[q] & 2) continue;
+        while (left < NS && (s_mark[left] & 1)) ++left;
+        uint8_t* out = &s_new[(size_t)q * CELL_RAW];
+        if (left < NS) memcpy(out, &s_c[(size_t)left++ * CELL_RAW], CELL_RAW);
+        else ret = cr_enc_det(0, s_zs, "z0", s_k, z++, out);
+    }
+    std::fill(s_mark.begin(), s_mark.end(), 0);        // which states ev left and entered, erased
     if (ret) { halt("new state failed"); return; }
     s_c.swap(s_new);
     std::fill(s_new.begin(), s_new.end(), 0);          // the old state, erased
@@ -1451,17 +1473,13 @@ static void print_summary() {
     if (s_steps)
         DES_LOG("  per step    : new state %.1f ms; decision sums and partial decryptions %.1f ms\n",
                 s_move_us / 1000.0 / s_steps, s_dec_us / 1000.0 / s_steps);
-    char seed[65]; hex_out(s_seed, 32, seed);
-    // Printed for the prototype: in a deployment the seed would be kept for the
-    // auditor only, for as long as a run may be audited.
-    DES_LOG("  audit       : every step signed; the opening, for the auditor only: seed %s\n", seed);
+    DES_LOG("  audit       : every step signed; the seed, printed at boot, was erased once the"
+            " initial state was encrypted\n");
     if (s_prep_idle && s_steps) {
-        double zeros = (double)s_z0_used / s_steps, item = s_prep_us / 1e6 / s_prep_idle;
-        DES_LOG("  prepared    : %u Enc(0) between steps (%.1f ms each), %u during a step; a step"
-                " uses %d for the cells, %.1f on average for the states the event leads nothing"
-                " into and %d for the decision rows: about %.1f s of preparation between events\n",
-                (unsigned)s_prep_idle, item * 1000.0, (unsigned)s_prep_step, NS, zeros,
-                (int)g_rows.size(), (NS + zeros + g_rows.size()) * item);
+        double item = s_prep_us / 1e6 / s_prep_idle;
+        DES_LOG("  prepared    : %u Enc(0) between steps (%.1f ms each), %u during a step: one per"
+                " decision row, about %.1f s of preparation between events\n",
+                (unsigned)s_prep_idle, item * 1000.0, (unsigned)s_prep_step, g_rows.size() * item);
     }
     DES_LOG("  frames      : %u sent, %u received, %u resent, %u NACKs sent, "
             "%u failed authentication\n", (unsigned)g_tx, (unsigned)g_rx,
@@ -1498,11 +1516,13 @@ static void handle(const Frame& f) {
                 }
                 DES_YIELD();
             }
+            wipe(s_seed, sizeof(s_seed));                  // see s_zs
             DES_LOG("[split] encrypted in %.1f ms; boot decisions\n", (des_micros() - t0) / 1000.0);
             s_new.assign((size_t)NS * CELL_RAW, 0);
-            s_pool.assign(s_pool_cap * CELL_RAW, 0);
-            s_k = 0; s_ev = NO_EVENT;
+            s_mark.assign(NS, 0);
+            s_k = 0; s_evx = NO_EVENT;
             boot_decs();
+            ratchet(s_zs);
             record_step();
             s_phase = S_IDLE;
             start_prepare();
@@ -1527,15 +1547,17 @@ static void handle(const Frame& f) {
 
     switch (h->type) {
     case T_STEP: {
-        uint16_t ev; memcpy(&ev, f.p(), 2);
         if (s_phase == S_IDLE && h->seq == s_k + 1) {
-            if (ev >= EVENT_COUNT) { halt("the plant sent an unknown event"); return; }
             uint64_t t0 = des_micros();
             while (!prep_done() && !g_halt) { prepare_one(true); DES_YIELD(); }   // the event came early
             if (g_halt) return;
-            s_k = h->seq; s_ev = ev;
-            move_all();
+            memcpy(&s_evx, f.p(), 2);
+            uint16_t ev = s_evx ^ event_pad();         // the event is kept nowhere after the move
+            if (ev >= EVENT_COUNT) { halt("the plant sent an unknown event"); return; }
+            s_k = h->seq;
+            move_all(ev);
             if (g_halt) return;
+            ratchet(s_zs);                             // z of this step: used
             s_move_us += des_micros() - t0;
             s_decs.assign(g_rows.size() * DECS_ITEM, 0);
             s_row_n = 0;
@@ -1571,19 +1593,20 @@ static void split_setup() {
         m.insert(m.end(), s_seed, s_seed + 32);
         m.insert(m.end(), t.begin(), t.end());
         cr_sha256(m.data(), m.size(), g_commit);
+        wipe(m.data(), m.size());
     }
     if (cr_keygen(DES_SUPERVISOR, s_seed, g_mykey)) { halt("key generation failed"); return; }
-    // The pool holds enough zeros for any event that the supervisor can see:
-    // NS minus the fewest states such an event leads into. An event that
-    // leads nowhere (a wrong one) has the rest drawn on the spot.
-    int reach_min = NS;
-    for (int e = 0; e < EVENT_COUNT; ++e)
-        if (g_moff[e + 1] > g_moff[e]) reach_min = std::min(reach_min, g_moff[e + 1] - g_moff[e]);
-    s_pool_cap = (size_t)std::max(NS - reach_min, 1);
+    cr_kdf(s_seed, "des_split zeros", s_zs);           // z_0
     if (!DES_TRANSPORT_IMPL.begin()) { halt("network down"); return; }
     DES_LOG("[split] SUPERVISOR board, epoch %08x, config %08x, P-%d: %d states, %d events, "
-            "%d decision sums per step, a pool of %d zeros\n", (unsigned)g_epoch, (unsigned)g_cfg,
-            DES_CURVE, NS, EVENT_COUNT, (int)g_rows.size(), (int)s_pool_cap);
+            "%d decision sums per step\n", (unsigned)g_epoch, (unsigned)g_cfg,
+            DES_CURVE, NS, EVENT_COUNT, (int)g_rows.size());
+    // Printed for the prototype: a deployment would hand the seed to the
+    // auditor only, who keeps it for as long as a run may be audited.
+    char seed[65]; hex_out(s_seed, 32, seed);
+    DES_LOG("[split] audit: the opening, for the auditor only: seed %s (erased from RAM once the"
+            " initial state is encrypted)\n", seed);
+    wipe(seed, sizeof(seed));
     DES_LOG("[split] waiting for the plant board's key share...\n");
 }
 

@@ -9,15 +9,16 @@ and writes every frame of the run; it stops a few seconds after the plant's
 FIN (or with Ctrl-C).
 
 check takes the recording, the supervisor's tables (the header) and its
-opening (the seed it printed in its summary, given to the auditor only), and
-its identity public key (DES_PUB_SUPERVISOR of secrets.h). From the seed and
-the events of the run (in the plant's STEP frames) it redoes everything the
-supervisor board computed: its key share, the initial encryption, and, at
-every step, the new encrypted state and every decision with the supervisor's
-part of its decryption. It compares them with the frames of the recording,
-and these with the chain of records that the supervisor signed after every
-step. A difference is a deviation of the supervisor, and its signature makes
-it undeniable.
+opening (the seed it printed at boot, given to the auditor only), and its
+identity public key (DES_PUB_SUPERVISOR of secrets.h). From the seed and the
+events of the run (encrypted in the plant's STEP frames: the seed gives the
+supervisor's key share, and with the plant's share in its KEY, the key of the
+event's encryption) it redoes everything the supervisor board computed: its key share, the
+initial encryption, and, at every step, the new encrypted state and every
+decision with the supervisor's part of its decryption. It compares them with
+the frames of the recording, and these with the chain of records that the
+supervisor signed after every step. A difference is a deviation of the
+supervisor, and its signature makes it undeniable.
 
 --mock checks a host run with the fake mbedTLS of the tests (the group Z_p,
 p = 2^61 - 1) instead of a NIST curve. No dependencies.
@@ -189,14 +190,15 @@ class Audit:
     def __init__(self, g, seed):
         self.g, self.seed = g, seed
 
-    def det(self, tag, a, b, ctr):
-        return hmac.new(self.seed, tag.encode() + struct.pack('<II', a, b) + bytes([ctr]), hashlib.sha256).digest()
+    def det(self, tag, a, b, ctr, key=None):
+        return hmac.new(key or self.seed, tag.encode() + struct.pack('<II', a, b) + bytes([ctr]),
+                        hashlib.sha256).digest()
 
-    def det_scalar(self, tag, a, b):
-        return self.g.scalar(self.det(tag, a, b, 1) + self.det(tag, a, b, 2))
+    def det_scalar(self, tag, a, b, key=None):
+        return self.g.scalar(self.det(tag, a, b, 1, key) + self.det(tag, a, b, 2, key))
 
-    def enc(self, m, tag, a, b):                # cr_enc_det
-        g, s = self.g, self.det_scalar(tag, a, b)
+    def enc(self, m, tag, a, b, key=None):      # cr_enc_det, under the seed or the key given
+        g, s = self.g, self.det_scalar(tag, a, b, key)
         V = g.mul(s, self.Y)
         if m: V = g.add(V, g.G)
         return (g.mul(s, g.G), V)
@@ -209,6 +211,10 @@ class Audit:
         R, z = g.point(sig[:P]), g.read(sig[P:P + g.size])
         c = g.mod_n(sha(pre + sig[:P]))
         return g.add(g.mul(z, g.G), g.mul(g.n - c, X)) == R
+
+
+def kdf(key, label):                            # cr_kdf
+    return hmac.new(key, label, hashlib.sha256).digest()
 
 
 def check(a):
@@ -249,7 +255,13 @@ def check(a):
     print('commitment opened: the seed and the tables are those the supervisor committed to at boot')
     kS = au.det_scalar('share', 0, 0)
     if g.raw(g.mul(kS, g.G)) != s_pay[:P]: sys.exit('the supervisor\'s key share is not derived from its seed')
-    au.Y = g.add(g.point(p_pay[:P]), g.point(s_pay[:P]))
+    Yp = g.point(p_pay[:P])
+    au.Y = g.add(Yp, g.point(s_pay[:P]))
+    # the key of the event's encryption (cr_session), K_1, and the supervisor's seed of
+    # the encryptions of zero of the boot, z_0; both move on at every step
+    w = g.raw(g.mul(g.n - kS, Yp))[:SC]
+    evk = hmac.new(w, b'des_split' + bytes([3]) + struct.pack('<II', ep, es), hashlib.sha256).digest()
+    zs = kdf(au.seed, b'des_split zeros')
 
     # the frames of the session, one copy each
     msg = {}
@@ -263,7 +275,7 @@ def check(a):
     # What the recording lacks is reported apart, and the rest still checked.
     # The state never travels: the auditor computes it from the seed and the
     # events, so a lost frame costs the check of that frame only.
-    def decisions(k, c):                        # None for a row with a cell that is not known
+    def decisions(k, c, z):                     # None for a row with a cell that is not known
         rows = []
         for gi, (mask, cells) in enumerate(t['rows']):
             if any(c[q] is None for q in cells):
@@ -271,35 +283,35 @@ def check(a):
                 continue
             d = (g.O, g.O)
             for q in cells: d = au.addc(d, c[q])
-            d = au.addc(d, au.enc(0, 'dz', k, gi))
+            d = au.addc(d, au.enc(0, 'dz', k, gi, z))
             D = g.mul(g.n - kS, d[0]) if d[0] != g.O else g.O
             rows.append(struct.pack('<Q', mask) + au.raw(d) + g.raw(D))
         return rows
 
-    # The new state of step k, event ev. Before the event every cell c[q] got
-    # enc(0, 'rr', k, q) (only those that move matter here); a state that ev
-    # leads into gets the sum of those of the states it comes from, any other
-    # state the next zero of the pool: the j-th taken since boot is
-    # enc(0, 'z0', j, 0), taken in the order of the states.
-    z0 = [0]                                    # zeros taken since boot; None once unknown
-
-    def move(k, ev, c):
-        new = []
+    # The new state of step k, event ev: the cells move. A state that ev leads
+    # into gets the cell of the state it comes from (the sum, if several); the
+    # cells of the states that ev does not leave go, in the order of the
+    # states, to the states that ev leads nothing into, and if they run out,
+    # those get enc(0, 'z0', k, j) under z_k, j = 0, 1, ...
+    def move(k, ev, c, z):
+        into = t['moves'][ev]
+        left = set(s for srcs in into.values() for s in srcs)
+        rest = [c[q] for q in range(NS) if q not in left]
+        new, j = [], 0
         for q in range(NS):
-            srcs = t['moves'][ev].get(q, [])
-            if not srcs:
-                new.append(None if z0[0] is None else au.enc(0, 'z0', z0[0], 0))
-                if z0[0] is not None: z0[0] += 1
-            elif any(c[s] is None for s in srcs):
-                new.append(None)
-            else:
+            if q in into:
                 cell = (g.O, g.O)
-                for s in srcs: cell = au.addc(cell, au.addc(c[s], au.enc(0, 'rr', k, s)))
+                for s in into[q]: cell = None if cell is None or c[s] is None else au.addc(cell, c[s])
                 new.append(cell)
+            elif rest:
+                new.append(rest.pop(0))
+            else:
+                new.append(au.enc(0, 'z0', k, j, z))
+                j += 1
         return new
 
-    def record(h, k, ev, rows):                 # chain_step
-        return sha(h + struct.pack('<IH', k, ev) + sha(b''.join(sha(r) for r in rows)))
+    def record(h, k, evx, rows):                # chain_step: the event encrypted
+        return sha(h + struct.pack('<IH', k, evx) + sha(b''.join(sha(r) for r in rows)))
 
     print('redoing every step', flush=True)
     h = sha(b'des_split record' + p_pay + s_pay + struct.pack('<II', ep, es))
@@ -322,33 +334,36 @@ def check(a):
             bad.append('the supervisor\'s signature is wrong')
             signed = None
         complete = None not in decs_rec
-        ev = NO_EVENT
+        ev = evx = NO_EVENT
+        z, zs = zs, kdf(zs, b'des_split next')  # z_k, and z_{k+1} for the next step
         if k > 0:
+            pad = struct.unpack('<H', kdf(evk, b'des_split event')[:2])[0]
+            evk = kdf(evk, b'des_split next')
             step = msg.get((T_STEP, k, 0))
-            ev = struct.unpack('<H', step['p'][:2])[0] if step else None
-            if ev is None:
+            evx = struct.unpack('<H', step['p'][:2])[0] if step else None
+            if evx is None:
                 miss.append('STEP')
                 if h is not None and complete and signed is not None:   # the event the signature fits
-                    fits = [e for e in range(E) if record(h, k, e, decs_rec) == signed]
-                    ev = fits[0] if len(fits) == 1 else None
+                    fits = [e for e in range(E) if record(h, k, e ^ pad, decs_rec) == signed]
+                    evx = fits[0] ^ pad if len(fits) == 1 else None
+            ev = None if evx is None else evx ^ pad
             if ev is None or ev >= E:
                 if ev is not None: bad.append(f'an unknown event {ev}')
                 miss.append('the event, so the state from here on')
                 c = [None] * NS
-                z0[0] = None                    # how many zeros it took is not known either
             else:
-                c = move(k, ev, c)
+                c = move(k, ev, c, z)
         unknown = []
-        for gi, row in enumerate(decisions(k, c)):
+        for gi, row in enumerate(decisions(k, c, z)):
             if decs_rec[gi] is None: miss.append(f'decision row {gi}')
             elif row is None: unknown.append(str(gi))
             elif row != decs_rec[gi]: bad.append(f'decision row {gi}')
         if unknown: miss.append('a cell of decision rows ' + ', '.join(unknown))
-        if h is not None and complete and ev is not None:
-            h = record(h, k, ev, decs_rec)
+        if h is not None and complete and evx is not None:
+            h = record(h, k, evx, decs_rec)
             if signed is not None and signed != h: bad.append('the recorded frames differ from what the supervisor signed')
         else:                                   # the record cannot be redone: go on from the signed one
-            if complete and ev is not None: miss.append('the record of an earlier step')
+            if complete and evx is not None: miss.append('the record of an earlier step')
             h = signed
         whole = sign is None and all(x is None for x in decs_rec) and (k == 0 or (T_STEP, k, 0) not in msg)
         if whole: miss = ['every frame of the step']
