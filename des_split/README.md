@@ -11,14 +11,17 @@ anything alone. The state is never decrypted, and the plant never receives it.
 
 The plant sends the event σ to the supervisor (`STEP`), encrypted, as a
 supervisor of the supervisory control theory receives it. The supervisor
-computes the next encrypted state for σ only, and the cells **move**: the new
-cell of q' is the cell of the state that σ leads to q' (the sum of their cells
-if σ leads several states there). The cells of the states that σ does not
-leave all encrypt 0, since the current state is one that σ leaves; they go, in
-the order of the states, to the states that σ leads nothing into, so that no
-cell is (O, O). In every supervisor of this repository no two states go to the
-same state on one event, so there are exactly as many; otherwise the states
-left get fresh encryptions of zero, drawn at the event. The supervisor then
+computes the next encrypted state for σ only, and the cells **move**, as if
+the supervisor were completed so that every event is a permutation of its
+states: the new cell of q' is the cell of the state that σ leads to q' (the
+sum of their cells if σ leads several states there); a state that σ neither
+leaves nor enters keeps its cell (a self-loop); and a state that σ leaves and
+does not enter gets the cell of a state that σ enters and does not leave (the
+way back), both taken in the order of the states. No cell is ever (O, O), and
+no cell of the state is encrypted again. In every supervisor of this
+repository no two states go to the same state on one event, so every event is
+such a permutation; otherwise the states left get fresh encryptions of zero,
+drawn at the event. The supervisor then
 computes the encrypted decisions — one homomorphic sum per distinct row of R
 among the controllable events, plus a fresh encryption of zero — adds its part
 of the decryption to each and sends them one row per frame; the plant finishes

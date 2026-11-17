@@ -473,3 +473,29 @@ five slow steps). S makes the new state in 5.1 ms and the rows in 1783.1 ms
 (123.9 ms per row). S prepares 11 Enc(0) per step, 227.2 ms each: 2.5 s
 between events. From the first event to the end of the run, 194.0 s on P's
 clock (4.41 s per event); encrypting the initial state took 95.2 s.
+
+## 15. Version 9: each event a permutation of the cells
+
+Until version 8, the cells of the states that σ does not leave went, in the
+order of the states, to the states that σ leads nothing into: a completion of
+σ to a permutation of the states, but one that shifted cells that σ does not
+concern. Now the completion is the one drawn in the paper's example: a state
+that σ neither leaves nor enters keeps its cell (a self-loop), and a state
+that σ leaves and does not enter gets the cell of a state that σ enters and
+does not leave (the way back), both in the order of the states. With the
+example of the paper (1 →α1 2 →β1 3 →α2 4 →β2 1), every event swaps two cells.
+When two states go to the same one on σ, the cells are summed and the states
+left get fresh Enc_Y(0), as before. The plant sees no difference; the auditor
+follows the same rule.
+
+The rule alone, without the cryptography: every event of the 2-, 3- and
+4-cluster tools is a permutation, 27–43 of 45, 251–393 of 419 and 2502–3906
+of 4184 cells stay in place per event, and a one-hot state follows the
+supervisor along the traces. On the host with mbedTLS 3.6 (P-256): the 2- and
+3-cluster tools pass every step, the 2-cluster tool also with 20 % of the
+frames dropped, the header with merges and the mock group too; the audit
+passes these recorded runs, recovers the event of a step whose `STEP` was
+removed, and reports the supervisor that adds an encryption of 1 to row 0 of
+step 3. The move is one copy per state in both versions: on the host, run
+back to back, the 3-cluster tool took 35.8 ms per step before and 34.9 ms
+after. Both roles build for the ESP32-S3. Not yet run on the boards.

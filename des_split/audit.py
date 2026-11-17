@@ -292,23 +292,27 @@ def check(a):
             rows.append(struct.pack('<Q', mask) + au.raw(d) + g.raw(D))
         return rows
 
-    # The new state of step k, event ev: the cells move. A state that ev leads
-    # into gets the cell of the state it comes from (the sum, if several); the
-    # cells of the states that ev does not leave go, in the order of the
-    # states, to the states that ev leads nothing into, and if they run out,
-    # those get enc(0, 'z0', k, j) under z_k, j = 0, 1, ...
+    # The new state of step k, event ev: the cells move, ev completed to a
+    # permutation of the states. A state that ev leads into gets the cell of
+    # the state it comes from (the sum, if several); a state that ev neither
+    # leaves nor enters keeps its cell; a state that ev leaves and does not
+    # enter gets the cell of a state that ev enters and does not leave, both
+    # in the order of the states, and if these run out, enc(0, 'z0', k, j)
+    # under z_k, j = 0, 1, ...
     def move(k, ev, c, z):
         into = t['moves'][ev]
         left = set(s for srcs in into.values() for s in srcs)
-        rest = [c[q] for q in range(NS) if q not in left]
+        back = [c[q] for q in range(NS) if q in into and q not in left]
         new, j = [], 0
         for q in range(NS):
             if q in into:
                 cell = (g.O, g.O)
                 for s in into[q]: cell = None if cell is None or c[s] is None else au.addc(cell, c[s])
                 new.append(cell)
-            elif rest:
-                new.append(rest.pop(0))
+            elif q not in left:
+                new.append(c[q])
+            elif back:
+                new.append(back.pop(0))
             else:
                 new.append(au.enc(0, 'z0', k, j, z))
                 j += 1

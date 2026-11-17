@@ -769,7 +769,7 @@ static uint32_t g_cfg = 0;
 static uint32_t config_fingerprint() {
     uint32_t h = 2166136261u;
     auto mix = [&](uint32_t v) { for (int i = 0; i < 4; ++i) { h ^= (v >> (8 * i)) & 0xff; h *= 16777619u; } };
-    mix(0x5350u + 8);                               // protocol version 8: the event key from an ephemeral key
+    mix(0x5350u + 9);                               // protocol version 9: each event a permutation of the cells
     mix(DES_CURVE);
     mix(NS); mix(EVENT_COUNT); mix((uint32_t)g_ctrl); mix((uint32_t)(g_ctrl >> 32));
     for (int q = 0; q < NS; ++q) mix(pm_i8(MONO_SUP.init, q));
@@ -1456,14 +1456,16 @@ static std::vector<uint8_t> tables_bytes() {
     }
     return t;
 }
-// The new state for the event ev: the cells move. The cell of each state q'
-// that ev leads into is the cell of the state that ev leads to q' (in these
-// supervisors there is one; if there are several, the sum of their cells).
-// The cells of the states that ev does not leave all encrypt 0, since the
-// current state is one that ev leaves; they go, in the order of the states,
-// to the states that ev leads nothing into. There are as many of them when no
-// two states go to the same one; otherwise the states left get fresh Enc_Y(0)
-// ("z0"), drawn here. No cell is copied: each is in one place only.
+// The new state for the event ev: the cells move, as if the supervisor were
+// completed so that ev is a permutation of the states. The cell of each state
+// q' that ev leads into is the cell of the state that ev leads to q' (in these
+// supervisors there is one; if there are several, the sum of their cells). A
+// state that ev neither leaves nor enters keeps its cell (a self-loop). A
+// state that ev leaves and does not enter gets the cell of a state that ev
+// enters and does not leave (the way back), both taken in the order of the
+// states. There are as many of each when no two states go to the same one;
+// otherwise the states left get fresh Enc_Y(0) ("z0"), drawn here. No cell is
+// copied: each is in one place only, and none is (O, O).
 static void move_all(uint16_t ev) {
     int ret = 0;
     for (int m = g_moff[ev]; m < g_moff[ev + 1] && ret == 0; ++m) {
@@ -1478,13 +1480,14 @@ static void move_all(uint16_t ev) {
             else ret = cr_sum(v, 2, out);
         }
     }
-    int left = 0;                                      // the next cell that ev does not leave
+    int back = 0;                                      // the next state that ev enters and does not leave
     uint32_t z = 0;
     for (int q = 0; q < NS && ret == 0; ++q) {
-        if (s_mark[q] & 2) continue;
-        while (left < NS && (s_mark[left] & 1)) ++left;
+        if (s_mark[q] & 2) continue;                   // ev enters q: made above
         uint8_t* out = &s_new[(size_t)q * CELL_RAW];
-        if (left < NS) memcpy(out, &s_c[(size_t)left++ * CELL_RAW], CELL_RAW);
+        if (!(s_mark[q] & 1)) { memcpy(out, &s_c[(size_t)q * CELL_RAW], CELL_RAW); continue; }   // stays
+        while (back < NS && s_mark[back] != 2) ++back;
+        if (back < NS) memcpy(out, &s_c[(size_t)back++ * CELL_RAW], CELL_RAW);
         else ret = cr_enc_det(0, s_zs, "z0", s_k, z++, out);
     }
     std::fill(s_mark.begin(), s_mark.end(), 0);        // which states ev left and entered, erased
