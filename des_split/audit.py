@@ -137,12 +137,7 @@ def read_header(path):
     rows = []
     en = lambda e, q: t['enable'][e * NS + q] != 0
     for e in range(E):
-        if not (t['ctrl'] >> e) & 1: continue
-        for r in rows:
-            if all((q in r[1]) == en(e, q) for q in range(NS)):
-                r[0] |= 1 << e
-                break
-        else:
+        if (t['ctrl'] >> e) & 1:                 # one row per controllable event
             rows.append([1 << e, [q for q in range(NS) if en(e, q)]])
     t['moves'], t['rows'] = moves, rows
     return t

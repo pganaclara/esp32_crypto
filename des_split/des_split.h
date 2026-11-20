@@ -791,8 +791,8 @@ static std::vector<Move>     g_move;
 static std::vector<uint16_t> g_move_src;
 static int g_moff[EVENT_COUNT + 1];
 
-// Decisions: one sum per DISTINCT row of R among the controllable events;
-// events with equal rows share it (optimization O2 of the paper).
+// Decisions: one sum per controllable event, over the states that enable it;
+// the frame names its event with a one-bit mask.
 struct RowGroup { uint64_t evmask; std::vector<uint16_t> cells; };
 static std::vector<RowGroup> g_rows;
 
@@ -815,17 +815,6 @@ static void build_tables() {
     g_moff[EVENT_COUNT] = (int)g_move.size();
     for (int e = 0; e < EVENT_COUNT; ++e) {
         if (!((g_ctrl >> e) & 1)) continue;         // uncontrollable: never disabled
-        bool merged = false;
-        for (auto& g : g_rows) {
-            bool same = true;
-            for (int q = 0; q < NS && same; ++q) {
-                bool in = false;
-                for (uint16_t c : g.cells) if (c == q) { in = true; break; }
-                same = (in == enabled(e, q));
-            }
-            if (same) { g.evmask |= 1ULL << e; merged = true; break; }
-        }
-        if (merged) continue;
         RowGroup g; g.evmask = 1ULL << e;
         for (int q = 0; q < NS; ++q) if (enabled(e, q)) g.cells.push_back((uint16_t)q);
         g_rows.push_back(g);
@@ -1085,7 +1074,7 @@ static void print_summary() {
     DES_LOG("  SPLIT — plant board (its key share, the events, the decisions)\n");
     DES_LOG("============================================\n");
     DES_LOG("  supervisor  : monolithic, %s: %d states, %d events (%d controllable),"
-            " %d distinct controllable rows\n", DES_DATA_HEADER, NS,
+            " %d controllable rows\n", DES_DATA_HEADER, NS,
             EVENT_COUNT, __builtin_popcountll(g_ctrl), (int)g_rows.size());
     DES_LOG("  curve       : NIST P-%d\n", DES_CURVE);
     DES_LOG("  trace       : %d of %d steps; decisions %s (%d steps checked, %d failed)\n",

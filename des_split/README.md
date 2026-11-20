@@ -22,8 +22,7 @@ no cell of the state is encrypted again. In every supervisor of this
 repository no two states go to the same state on one event, so every event is
 such a permutation; otherwise the states left get fresh encryptions of zero,
 drawn at the event. The supervisor then
-computes the encrypted decisions — one homomorphic sum per distinct row of R
-among the controllable events, plus a fresh encryption of zero — adds its part
+computes the encrypted decisions — one homomorphic sum per controllable event, plus a fresh encryption of zero — adds its part
 of the decryption to each and sends them one row per frame; the plant finishes
 each with a zero test.
 
@@ -36,7 +35,7 @@ per addition.
 |---|---|---|
 | `READY` | supervisor → plant, before the event: its encryptions of zero are ready | 1 |
 | `STEP` | plant → supervisor: the step and the event, encrypted | 1 |
-| `DECS` | supervisor → plant: (events, sum, its part of the decryption), one row per frame | one per distinct controllable row (7, 11, 15 for 2, 3, 4 clusters) |
+| `DECS` | supervisor → plant: (events, sum, its part of the decryption), one row per frame | one per controllable event (7, 11, 15 for 2, 3, 4 clusters) |
 | `SIGN` | supervisor → plant: the signed record of the step | 1 |
 
 A lost frame is asked for again: a `STEP` that gets no row is sent again, and

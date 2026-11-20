@@ -310,8 +310,8 @@ preparing a candidate for every transition of every event (versions 1–6).
   states go to the same state on one event there are exactly as many, and so
   in every supervisor of the repository (the 2-, 3- and 4-cluster tools, the
   small and the extended small factory); otherwise the states left get fresh
-  Enc_Y(0) drawn at the event (tag "z0"). Then every distinct controllable
-  row: the sum of its cells and of its Enc_Y(0), and D = −k_S·U, sent one row
+  Enc_Y(0) drawn at the event (tag "z0"). Then, for every controllable
+  event, its row: the sum of its cells and of its Enc_Y(0), and D = −k_S·U, sent one row
   per frame. P zero-tests each row as it arrives. There is no permutation, no
   candidate and no `NEWST`: P never receives a cell of the state. The step's
   only scalar multiplications are the D of S, one per row, and the zero tests
