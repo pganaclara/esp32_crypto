@@ -144,7 +144,7 @@ the seed the supervisor opens to it, redoes every step:
 The computer must be on the boards' Wi-Fi network itself (the same SSID: a
 router's 2.4 GHz and 5 GHz networks may not pass multicast to each other), and
 `record` must start before the boards are reset, since the run begins with the
-`KEY` frames. The seed changes at every boot: use the one of the recorded run.
+`KEY` frames. The seed changes at every boot: use the one of the recorded run. A recording of a 3-cluster run on the boards, 1065 frames without a gap, was audited this way: the commitment opened and the 45 steps, the boot included, were redone without a deviation.
 
 The state never travels: `check` computes it from the seed and the events (in
 the plant's `STEP` frames, which it decrypts: the seed gives the supervisor's
@@ -165,18 +165,21 @@ needs: the plant's share stays secret.
 The cost is one signature per step on the supervisor and one verification on
 the plant, both between events.
 
-## Encryptions of zero drawn before the event
+## Encryptions of zero drawn at boot
 
-Drawing an encryption of zero (sG, sY) costs two scalar multiplications. The
-supervisor draws those of a step, one per decision row, **before** the event,
-while it is idle, kept in RAM only (regenerated at every boot, never written
-to flash). Each is used once and then erased, so no encryption of zero is
-ever used twice; a step that comes before they are ready has the supervisor
-finish them on the spot. The benchmark replays the trace
-back to back, so the plant fires the next event once the supervisor's `READY`
-has come: that stands for the time a real plant spends between two events. The
-step time is then the latency from the event to the decisions, and the
-preparation time is reported apart.
+Drawing an encryption of zero (sG, sY) costs two scalar multiplications. Right
+after the initial state, the supervisor draws those of the first
+`DES_POOL_STEPS` steps (by default, the whole trace), one per decision row and
+per step, kept in RAM only (regenerated at every boot, never written to
+flash). They are the values it drew before, from z_k, so the frames and the
+audit do not change. Each is used once and then erased, so no encryption of
+zero is ever used twice, and nothing is prepared between those events. A step
+beyond the stock has its encryptions drawn while the supervisor is idle,
+before the event, as with `#define DES_POOL_STEPS 0`; a step that comes before
+they are ready has the supervisor finish them on the spot. A plant that runs
+on would refill the stock between events. The benchmark replays the trace
+back to back: the plant fires the next event once the supervisor's `READY`
+has come.
 
 ## Run
 
@@ -214,42 +217,41 @@ step.
 Two ESP32-S3, P-256, one run per size; every decision of every step matched
 the supervisor in clear. The 2- and 3-cluster runs are of this code; the
 4-cluster run was made before the key of the events came from an ephemeral
-key and before every event became a permutation of the cells, which change the
-boot and which cell goes where, not the work of a step:
+key, before every event became a permutation of the cells and before the
+stock of encryptions of zero, which change the boot and which cell goes where,
+not the work of a step:
 
 | | 2-cluster tool | 3-cluster tool | 4-cluster tool |
 |---|---|---|---|
 | states, decision rows, steps | 45, 7, 28 | 419, 11, 44 | 4184, 15, 60 |
-| step, mean (from the event to the decisions) | 1091.8 ms (1074.6–1255.4) | 1953.2 ms (1934.4–2057.7) | 6876.1 ms (6844.4–7001.2) |
-| plant: waiting for the rows | 223.1 ms | 589.7 ms | 5015.5 ms |
-| plant: zero tests | 868.7 ms (124.1 ms per row) | 1363.5 ms (124.0 ms per row) | 1860.6 ms (124.0 ms per row) |
-| supervisor: the new state (decrypting the event, moving the cells) | 0.6 ms | 5.1 ms | 50.0 ms |
-| supervisor: the rows | 933.1 ms (133.3 ms per row) | 1785.1 ms (162.3 ms per row) | 6627.6 ms (441.8 ms per row) |
-| supervisor: Enc(0) per step, drawn before the event | 7, one per row | 11, one per row | 15, one per row |
-| supervisor, between events | 1.6 s (227.6 ms per Enc(0)) | 2.5 s (227.4 ms per Enc(0)) | 3.4 s (228.0 ms per Enc(0)) |
-| from the first event to the end of the run (plant) | 73.7 s (2.63 s per event) | 193.4 s (4.40 s per event) | 614.5 s (10.24 s per event) |
-| encrypting the initial state | 10.2 s | 95.4 s | 952.8 s |
-| rows sent again | 0 | 7 (1 NACK) | 896 (821 NACKs, see below) |
+| step, mean (from the event to the decisions) | 1119.3 ms (1077.8–1205.3) | 2013.1 ms (1948.3–2166.0) | 6876.1 ms (6844.4–7001.2) |
+| plant: waiting for the rows | 249.5 ms | 647.8 ms | 5015.5 ms |
+| plant: zero tests | 869.8 ms (124.3 ms per row) | 1365.3 ms (124.1 ms per row) | 1860.6 ms (124.0 ms per row) |
+| supervisor: the new state (decrypting the event, moving the cells) | 0.6 ms | 5.2 ms | 50.0 ms |
+| supervisor: the rows | 934.2 ms (133.5 ms per row) | 1787.7 ms (162.5 ms per row) | 6627.6 ms (441.8 ms per row) |
+| supervisor: Enc(0) per step, one per row | 7, drawn at boot | 11, drawn at boot | 15, drawn before the event |
+| supervisor, between events | nothing | nothing | 3.4 s (228.0 ms per Enc(0)) |
+| from the first event to the end of the run (plant) | 38.1 s (1.36 s per event) | 99.2 s (2.25 s per event) | 614.5 s (10.24 s per event) |
+| boot: the initial state, then the stock of Enc(0) | 10.3 s + 44.7 s (196, 228.0 ms each) | 95.6 s + 110.2 s (484, 227.8 ms each) | 952.8 s |
+| rows sent again | 0 | 4 (1 NACK) | 896 (821 NACKs, see below) |
 
 A row costs the supervisor more than a zero test costs the plant (most of it
 is D = −k_S U, the rest the sum), so the step is the supervisor's new state
 and rows, plus the last zero test and the link: the plant tests each row while
 the supervisor makes the next. The step grows with the rows and the size of
-their sums, the time between events with the rows only, and the encryption of
-the initial state with the number of states. In the 2-cluster run, one step
-(1255.4 ms) waited 179 ms longer for its rows than the median step, with the
-same zero tests and no frame sent again; without it the mean is 1085.7 ms
-(1074.6–1105.7). In the 3-cluster run, three steps (2000.5–2057.7 ms) waited
-53–115 ms longer for their rows than the median step, with the same zero
-tests; without them the mean is 1948.1 ms (1934.4–1966.4). The permutation did
-not change the step: before it (protocol 8), without their slow steps, 1081.9
-ms and 1947.2 ms; before the ephemeral key, 1078.1 ms and 1951.5 ms. A whole
-2-cluster run takes about 1.4 min: 10.2 s encrypting the initial state, then
-73.7 s for the 28 events. A whole 3-cluster run takes about 5 min: 95.4 s
-encrypting the initial state, then 193.4 s for the 44 events (the
-plant's clock, from the first event to the end). The 4-cluster run took
-26.4 min from the plant's boot, both boards reset together: 952.8 s encrypting
-the initial state, then 614.5 s for the 60 events. There a row took the
+their sums, and the boot with the number of states and, for the stock, with the
+rows times the steps. In the 2-cluster run the wait for the rows ranged from
+209 to 344 ms, in the 3-cluster run from 583 to 797 ms, with the same rows and
+zero tests: the steps are 27 and 60 ms longer than in the runs made before the
+stock (1091.8 and 1953.2 ms, with rows of 933.1 and 1785.1 ms), and the
+difference is the link. The time per event is the step and its signed record,
+which the plant checks before the next event. A whole 2-cluster run takes
+about 1.6 min: 10.3 s encrypting the initial state and 44.7 s drawing the
+stock, then 38.1 s for the 28 events. A whole 3-cluster run takes about 5 min:
+95.6 s and 110.2 s, then 99.2 s for the 44 events (the plant's clock, from the
+first event to the end). The 4-cluster run took 26.4 min from the plant's
+boot, both boards reset together: 952.8 s encrypting the initial state, then
+614.5 s for the 60 events. There a row took the
 supervisor 441.8 ms, longer than the 300 ms of silence after which the plant
 then asked with a `NACK` for the rows it lacked: it asked in almost every gap,
 and the supervisor sent almost every row twice. Every decision still came

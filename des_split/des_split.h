@@ -1368,11 +1368,46 @@ static uint8_t  s_sign[SIGN_PAY];              // SIGN of step s_k, kept for res
 static uint32_t s_prep_idle = 0, s_prep_step = 0, s_t_rdy = 0;
 static uint64_t s_prep_us = 0;                 // time spent preparing them while idle
 
+// The stock: those of steps 1 to DES_POOL_STEPS are made at boot, right after
+// the initial state, so that these steps need no preparation between events;
+// the steps after them are prepared as above. By default the stock covers the
+// trace; a plant that runs on would refill it between events.
+#ifndef DES_POOL_STEPS
+#define DES_POOL_STEPS SIM_SEQ_LEN
+#endif
+static std::vector<uint8_t> s_pool;            // step k, row n at ((k-1) * rows + n) * CELL_RAW
+static uint32_t s_pool_steps = 0;
+static uint64_t s_pool_us = 0;
+static void make_pool() {                      // s_zs is z_1
+    uint64_t t0 = des_micros();
+    const size_t R = g_rows.size();
+    s_pool.assign((size_t)DES_POOL_STEPS * R * CELL_RAW, 0);
+    uint8_t z[32]; memcpy(z, s_zs, 32);
+    for (uint32_t k = 1; k <= (uint32_t)DES_POOL_STEPS; ++k) {
+        for (size_t n = 0; n < R; ++n) {
+            if (cr_enc_det(0, z, "dz", k, (uint32_t)n, &s_pool[((k - 1) * R + n) * CELL_RAW])) {
+                halt("preparation failed"); return;
+            }
+            DES_YIELD();
+        }
+        ratchet(z);                            // z_{k+1}
+    }
+    wipe(z, sizeof(z));
+    s_pool_steps = DES_POOL_STEPS;
+    s_pool_us = des_micros() - t0;
+}
 static bool prep_done() { return s_dz_n == g_rows.size(); }
 static void start_prepare() {
     s_prep_k = s_k + 1;
     s_dz.assign(g_rows.size() * CELL_RAW, 0);
     s_dz_n = 0;
+    if (s_prep_k <= s_pool_steps) {            // from the stock, erased there
+        uint8_t* src = &s_pool[(size_t)(s_prep_k - 1) * g_rows.size() * CELL_RAW];
+        memcpy(s_dz.data(), src, s_dz.size());
+        wipe(src, s_dz.size());
+        s_dz_n = g_rows.size();
+        send_simple(T_READY, s_prep_k); s_t_rdy = des_millis();   // ready at once
+    }
 }
 static void prepare_one(bool in_step) {
     uint64_t t0 = des_micros();
@@ -1517,7 +1552,13 @@ static void print_summary() {
                 s_move_us / 1000.0 / s_steps, s_dec_us / 1000.0 / s_steps);
     DES_LOG("  audit       : every step signed; the seed, printed at boot, was erased once the"
             " initial state was encrypted\n");
-    if (s_prep_idle && s_steps) {
+    if (s_pool_steps) {
+        DES_LOG("  stock       : %u Enc(0) made at boot for steps 1-%u (%.1f ms each, %.1f s in all):"
+                " no preparation between those events\n",
+                (unsigned)(s_pool_steps * g_rows.size()), (unsigned)s_pool_steps,
+                s_pool_us / 1000.0 / (s_pool_steps * g_rows.size()), s_pool_us / 1e6);
+    }
+    if (s_prep_idle && s_steps > s_pool_steps) {      // steps beyond the stock
         double item = s_prep_us / 1e6 / s_prep_idle;
         DES_LOG("  prepared    : %u Enc(0) between steps (%.1f ms each), %u during a step: one per"
                 " decision row, about %.1f s of preparation between events\n",
@@ -1565,6 +1606,12 @@ static void handle(const Frame& f) {
             s_k = 0; s_evx = NO_EVENT;
             boot_decs();
             ratchet(s_zs);
+            if (DES_POOL_STEPS > 0) {
+                make_pool();
+                if (g_halt) return;
+                DES_LOG("[split] stock: %u Enc(0) for steps 1-%u made in %.1f ms\n",
+                        (unsigned)(s_pool_steps * g_rows.size()), (unsigned)s_pool_steps, s_pool_us / 1000.0);
+            }
             record_step();
             s_phase = S_IDLE;
             start_prepare();
